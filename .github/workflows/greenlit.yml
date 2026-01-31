@@ -1,0 +1,86 @@
+name: Greenlit CI Fix
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  triage:
+    name: Triage CI Failure
+    runs-on: ubuntu-latest
+    # Only run on failures from the CI workflow
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Greenlit
+        run: npm run build
+
+      - name: Run Greenlit Triage
+        id: triage
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          node dist/index.js triage \
+            --run-id ${{ github.event.workflow_run.id }} \
+            --repo ${{ github.repository }} \
+            --branch ${{ github.event.workflow_run.head_branch }} \
+            --sha ${{ github.event.workflow_run.head_sha }} \
+            --output greenlit-result.json
+
+          # Check if fix was successful
+          if [ -f greenlit-result.json ]; then
+            success=$(jq -r '.success' greenlit-result.json)
+            echo "success=$success" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Fix PR
+        if: steps.triage.outputs.success == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node dist/index.js publish \
+            --result greenlit-result.json \
+            --base-branch ${{ github.event.workflow_run.head_branch }}
+
+      - name: Post Analysis Comment
+        if: steps.triage.outputs.success != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node dist/index.js publish \
+            --result greenlit-result.json \
+            --base-branch ${{ github.event.workflow_run.head_branch }} \
+            --comment-only
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: greenlit-results
+          path: |
+            greenlit-result.json
+            greenlit-result-rca.md
+          retention-days: 7

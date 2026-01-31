@@ -1,0 +1,57 @@
+# greenlit.yml - User configuration
+version: 1
+
+# Guardrails
+guardrails:
+  max_diff_lines: 200           # Maximum lines changed
+  max_runtime_seconds: 300      # 5 minute timeout
+  allowed_commands:             # Allowlist for verification
+    - "npm test"
+    - "npm run lint"
+    - "npm run build"
+    - "npm run typecheck"
+    - "pytest"
+    - "cargo test"
+    - "go test ./..."
+    - "vitest"
+    - "jest"
+  forbidden_patterns:           # Never modify these
+    - "*.env*"
+    - "*secret*"
+    - "package-lock.json"
+    - "yarn.lock"
+    - "pnpm-lock.yaml"
+
+# Behavior
+behavior:
+  auto_pr: true                 # Create PR automatically
+  require_verification: true    # Must pass re-run before PR
+  max_retries: 1                # Retry fix attempts
+  failure_types:                # Which failures to handle
+    - test
+    - lint
+    - typecheck
+    - build
+
+# Routing - failure class routing decisions
+routing:
+  # Route to report-only (no code changes)
+  report_only:
+    - secrets
+    - permissions
+    - infra_outage
+    - dependency_registry
+  # Route to fix attempt
+  fix_attempt:
+    - test
+    - lint
+    - typecheck
+    - build
+  # Route to flake workflow
+  flake_workflow:
+    - flaky
+
+# Output
+output:
+  pr_title_template: "fix(greenlit): {failure_type} - {summary}"
+  branch_prefix: "greenlit/fix"

@@ -6,7 +6,7 @@
 
 ## Executive Summary
 
-Greenlit++ is **CLI-first**: the core triage/patch/verify loop runs via **`codex exec`** in CI for maximum reliability and speed. A **thin TypeScript orchestrator** handles log collection, guardrails, reporting, and PR publishing for a polished developer experience. The Codex SDK and MCP Server are optional extensions for richer orchestration or future service-style deployment.
+Greenlit++ is **CLI-first**: the core triage/patch/verify loop runs via **`codex exec`** in CI for maximum reliability and speed. A **thin TypeScript orchestrator** handles log collection, guardrails, routing, reporting, and PR publishing for a polished developer experience. The Codex SDK and MCP Server are optional extensions for richer orchestration or future service-style deployment.
 
 ### Key Integration Points with Codex
 | Component | Codex Feature Used | Purpose |
@@ -15,6 +15,12 @@ Greenlit++ is **CLI-first**: the core triage/patch/verify loop runs via **`codex
 | Tool Execution | Sandbox policies (`workspace-write`) | Safe command execution for tests/lint |
 | Optional Orchestration | TypeScript SDK (`@openai/codex-sdk`) | Programmatic control, retries, richer telemetry |
 | Optional Agent Mesh | `codex mcp-server` | Multi-agent handoffs and tool exposure |
+
+### Codex CLI Configuration Strategy
+- **`greenlit.yml` is product config** (guardrails, routing, verify harness).  
+- **Codex config uses `.codex/config.toml`** for defaults, plus `codex exec --config key=value` overrides.  
+- **Approvals use `--ask-for-approval`** (not a custom policy flag).  
+- Keep SDK path optional until its API is confirmed; do not block MVP on it.
 
 ---
 
@@ -49,16 +55,18 @@ Greenlit++ is **CLI-first**: the core triage/patch/verify loop runs via **`codex
 
 ## Developer Experience (External View)
 - Dev opens PR → CI fails.
-- Greenlit posts a comment with: failure signature, root cause summary, fix summary, verification result.
+- Greenlit posts a comment with: failure signature, routing decision (fix vs report-only vs quarantine), fix summary, verification result, evidence excerpt.
 - If fix succeeds, Greenlit opens an auto-PR with a small diff and an RCA report.
 - Dev reviews the diff + evidence, merges, and CI turns green.
 
 ## Internal Pipeline (High-Level View)
-1) Trigger on `workflow_run` failure.  
-2) Collect logs, failing job/step, error signature, and likely failing command.  
-3) Load guardrails from `greenlit.yml` (allowlist, diff limit, timeouts).  
-4) Run `codex exec` to diagnose → patch → verify.  
-5) Generate RCA markdown and publish PR (or comment-only if no fix).  
+1) Trigger on `workflow_run` failure (with fork-safe gating).  
+2) Collect jobs/steps + logs (unzipped), extract error signature + evidence.  
+3) Compute signature hash; check ledger for dedupe/known outcomes.  
+4) Route to a playbook (fix vs report-only vs quarantine).  
+5) Load guardrails + verification harness from `greenlit.yml`.  
+6) Run `codex exec` to diagnose → patch → verify (hermetic harness).  
+7) Generate RCA markdown and publish PR (or comment-only if no fix).  
 
 ---
 
@@ -68,10 +76,14 @@ Greenlit++ is **CLI-first**: the core triage/patch/verify loop runs via **`codex
 
 ```
 greenlit/
+├── .codex/
+│   └── config.toml              # Codex CLI defaults (sandbox/env policy)
 ├── .github/
 │   └── workflows/
 │       ├── ci.yml                 # Main CI workflow (for demo repo)
 │       └── greenlit.yml         # Greenlit trigger workflow
+├── data/
+│   └── signatures.json          # Signature ledger (CI artifact; not committed)
 ├── scripts/
 │   └── greenlit.sh               # CLI-first wrapper around codex exec
 ├── src/
@@ -107,6 +119,8 @@ greenlit/
     "@openai/codex-sdk": "latest",
     "@octokit/rest": "^20.0.0",
     "@octokit/webhooks-types": "^7.3.0",
+    "adm-zip": "^0.5.10",
+    "picomatch": "^3.0.1",
     "zod": "^3.22.0",
     "commander": "^12.0.0",
     "chalk": "^5.3.0"
@@ -154,6 +168,33 @@ behavior:
     - typecheck
     - build
 
+# Routing
+routing:
+  report_only_classes:
+    - infra
+    - secrets
+    - permissions
+  flake_reruns: 3
+  max_attempts_per_signature: 2
+
+# Signature ledger
+signature_ledger:
+  path: "data/signatures.json"
+  ttl_days: 30
+
+# Verification harness
+verification:
+  install_command: "npm ci"
+  command_map:
+    test: "npm test"
+    lint: "npm run lint"
+    typecheck: "npm run typecheck"
+    build: "npm run build"
+
+# Fork safety
+fork_policy:
+  mode: "comment-only"          # comment-only for forks or missing secrets
+
 # Output
 output:
   pr_title_template: "fix(greenlit): {failure_type} - {summary}"
@@ -174,12 +215,16 @@ export interface WorkflowRunContext {
   repo: { owner: string; repo: string };
   headSha: string;
   headBranch: string;
+  baseBranch?: string;
+  pullRequests?: Array<{ number: number; url: string }>;
   failedJobs: FailedJob[];
 }
 
 export interface FailedJob {
   jobId: number;
   jobName: string;
+  runnerName?: string;
+  runnerOs?: string;
   failedSteps: FailedStep[];
   logs: string;
 }
@@ -216,6 +261,8 @@ export async function collectFailureContext(
     failedJobs.push({
       jobId: job.id,
       jobName: job.name,
+      runnerName: job.runner_name || undefined,
+      runnerOs: job.runner_os || undefined,
       failedSteps: failedSteps.map(s => ({
         stepName: s.name,
         conclusion: s.conclusion || "unknown",
@@ -231,6 +278,11 @@ export async function collectFailureContext(
     repo: { owner, repo },
     headSha: run.head_sha,
     headBranch: run.head_branch || "unknown",
+    baseBranch: run.pull_requests?.[0]?.base?.ref,
+    pullRequests: (run.pull_requests || []).map((pr: any) => ({
+      number: pr.number,
+      url: pr.url
+    })),
     failedJobs
   };
 }
@@ -241,12 +293,20 @@ async function fetchJobLogs(
   const { data } = await octokit.rest.actions.downloadJobLogsForWorkflowRun({
     owner, repo, job_id: jobId
   });
-  return data as unknown as string;
+  // GitHub returns a zip (or a redirect to a zip). Follow redirects, unzip, and concatenate.
+  const zipBuffer = Buffer.isBuffer(data) ? data : Buffer.from(data as any);
+  return unzipAndConcat(zipBuffer);
 }
 
 function truncateLogs(logs: string, maxChars: number): string {
   if (logs.length <= maxChars) return logs;
   return "... [truncated] ...\n" + logs.slice(-maxChars);
+}
+
+function unzipAndConcat(zipBuffer: Buffer): string {
+  // TODO: unzip GitHub Actions logs and concatenate files in order
+  // Use a zip helper library (adm-zip) or node's unzip utilities
+  return "";
 }
 ```
 
@@ -272,6 +332,13 @@ export interface FailureContext {
   // Logs (truncated)
   rawLogs: string;
   extractedErrors: string[];    // Parsed error messages
+  evidence?: {
+    file?: string;
+    line?: string;
+    excerpt?: string;
+    job?: string;
+    step?: string;
+  };
 
   // Git context
   changedFiles: string[];       // Files changed in this PR
@@ -299,7 +366,7 @@ export async function buildFailureContext(
   const relevantFiles = extractFilePaths(combinedLogs);
 
   // Get git context
-  const changedFiles = getChangedFiles(headSha);
+  const changedFiles = await getChangedFiles(runContext);
   const recentCommits = getRecentCommits(5);
 
   return {
@@ -334,6 +401,11 @@ function extractErrorSignature(logs: string): string {
   const patterns = [
     /Error:.*$/m,
     /FAIL.*$/m,
+    /TS\d+:\s.*$/m,
+    /tsc\s+--.*$/m,
+    /pytest.*(failed|error).*/m,
+    /go test.*(FAIL|panic).*/m,
+    /cargo test.*(FAILED|panic).*/m,
     /error\[E\d+\]:.*$/m,
     /TypeError:.*$/m,
     /AssertionError:.*$/m
@@ -347,18 +419,30 @@ function extractErrorSignature(logs: string): string {
 }
 
 function extractFilePaths(logs: string): string[] {
-  const filePattern = /(?:^|\s)((?:src|lib|test|tests|app)\/[\w\-\/\.]+\.\w+)/gm;
+  const filePattern = /(?:^|\s)((?:src|lib|test|tests|app)\/[\w\-\/\.]+\.\w+(?::\d+(?::\d+)?)?)/gm;
   const matches = [...logs.matchAll(filePattern)];
   return [...new Set(matches.map(m => m[1]))].slice(0, 10);
 }
 
-function getChangedFiles(sha: string): string[] {
+async function getChangedFiles(runContext: WorkflowRunContext): Promise<string[]> {
+  // Prefer PR API if workflow_run has pull_requests
+  // Fallback to merge-base diff for non-PR runs
   try {
-    const result = execSync(`git diff --name-only HEAD~1`, { encoding: "utf-8" });
+    if (runContext.pullRequests?.length) {
+      return await fetchPullRequestFiles(runContext.pullRequests[0]);
+    }
+    const baseBranch = runContext.baseBranch || "main";
+    const base = execSync(`git merge-base HEAD origin/${baseBranch}`, { encoding: "utf-8" }).trim();
+    const result = execSync(`git diff --name-only ${base}..HEAD`, { encoding: "utf-8" });
     return result.trim().split("\n").filter(Boolean);
   } catch {
     return [];
   }
+}
+
+async function fetchPullRequestFiles(pr: { number: number }): Promise<string[]> {
+  // TODO: use Octokit pulls.listFiles to fetch PR file list
+  return [];
 }
 
 function getRecentCommits(count: number): string[] {
@@ -371,11 +455,86 @@ function getRecentCommits(count: number): string[] {
 }
 ```
 
+### 2.3 Routing + Signature Ledger (`src/agent/routing.ts`, `src/agent/signatures.ts`)
+Route each failure to a **decision** before attempting a fix. Persist the outcome to prevent PR spam and improve decisions over time.
+
+```typescript
+export type FailureClass =
+  | "code"
+  | "infra"
+  | "secrets"
+  | "permissions"
+  | "flake"
+  | "unknown";
+
+export interface RouteDecision {
+  action: "fix" | "report-only" | "quarantine";
+  failureClass: FailureClass;
+  reason: string;
+}
+
+export function routeFailure(context: FailureContext): RouteDecision {
+  const logs = context.rawLogs.toLowerCase();
+
+  if (/missing required secret|permission denied|resource not accessible|unauthorized|forbidden/.test(logs)) {
+    return { action: "report-only", failureClass: "secrets", reason: "Missing secret/permission" };
+  }
+  if (/rate limit|429|503|timeout|dns|temporary failure/.test(logs)) {
+    return { action: "report-only", failureClass: "infra", reason: "Infra or external outage suspected" };
+  }
+  if (/flaky|intermittent|retrying/.test(logs)) {
+    return { action: "quarantine", failureClass: "flake", reason: "Flake suspected" };
+  }
+  return { action: "fix", failureClass: "code", reason: "Deterministic code failure" };
+}
+```
+
+```typescript
+export interface SignatureRecord {
+  signature: string;
+  attempts: number;
+  lastSeen: string;
+  lastOutcome: "fix" | "report-only" | "quarantine" | "failed";
+}
+
+export function computeSignature(context: FailureContext): string {
+  const payload = [
+    context.repo,
+    context.failureType,
+    context.errorSignature,
+    context.failedCommand,
+    context.evidence?.job || "",
+    context.evidence?.step || ""
+  ].join("|");
+  return sha256(payload);
+}
+```
+
+Signature ledger rules:
+- If `attempts >= max_attempts_per_signature` within TTL → **comment-only** (no PR).  
+- If prior outcome was report-only for infra/secrets → **do not attempt fix**.  
+Store the ledger as a CI artifact or repo-specific cache; do not commit it to main.  
+
+### 2.4 Evidence Pack (`src/collector/evidence.ts`)
+Generate a small, stable artifact for trust and judge optics.
+
+Evidence fields:
+- file + line (if present in logs)
+- 5-10 line log excerpt
+- failing job/step name
+- command that was run for verification
+
 ---
 
 ## Phase 3: Codex Agent Orchestrator
 
 ### 3.1 Main Orchestrator (`src/agent/orchestrator.ts`)
+
+Before attempting a fix:
+- Check the **signature ledger** for dedupe and max attempts.
+- Apply **routing decision**: `fix` vs `report-only` vs `quarantine`.
+- Only proceed to patching when action is `fix`.
+ - Only publish PRs when verification passes and confidence is high.
 
 ```typescript
 import { Codex, Thread } from "@openai/codex-sdk";
@@ -385,6 +544,8 @@ import { verifyFix } from "./verifier";
 
 export interface TriageResult {
   success: boolean;
+  signature: string;
+  decision: "fix" | "report-only" | "quarantine";
   rootCause: string;
   fixSummary: string;
   patchDiff: string;
@@ -395,17 +556,15 @@ export interface TriageResult {
 
 export async function runTriageAgent(
   context: FailureContext,
-  config: GreenlitConfig
+  config: GreenlitConfig,
+  signature: string,
+  decision: "fix"
 ): Promise<TriageResult> {
   const codex = new Codex();
 
   // Optional: SDK-based orchestration path (CLI-first is default via scripts/greenlit.sh)
-  const thread = codex.startThread({
-    model: "o4-mini",  // or "codex" depending on availability
-    sandboxMode: "workspace-write",
-    workingDirectory: process.cwd(),
-    approvalPolicy: "on-request"  // Agent can request escalation
-  });
+  // Keep SDK usage minimal and load sandbox/env settings from .codex/config.toml
+  const thread = codex.startThread();
 
   try {
     // ─────────────────────────────────────────────────────────────
@@ -422,6 +581,8 @@ export async function runTriageAgent(
     if (!diagnosis.canFix) {
       return {
         success: false,
+        signature,
+        decision,
         rootCause: diagnosis.rootCause,
         fixSummary: "Unable to generate automated fix",
         patchDiff: "",
@@ -450,11 +611,7 @@ export async function runTriageAgent(
     // ─────────────────────────────────────────────────────────────
     console.log("✅ Phase 3: Verifying fix...");
 
-    const verificationResult = await verifyFix(
-      context.failedCommand,
-      config.guardrails.allowed_commands,
-      thread
-    );
+    const verificationResult = await verifyFix(context.failureType, config);
 
     if (!verificationResult.passed) {
       // Attempt one retry with feedback
@@ -463,15 +620,13 @@ export async function runTriageAgent(
       const retryPrompt = PROMPTS.retryFix(verificationResult.output);
       await thread.run(retryPrompt);
 
-      const retryVerification = await verifyFix(
-        context.failedCommand,
-        config.guardrails.allowed_commands,
-        thread
-      );
+      const retryVerification = await verifyFix(context.failureType, config);
 
       if (!retryVerification.passed) {
         return {
           success: false,
+          signature,
+          decision,
           rootCause: diagnosis.rootCause,
           fixSummary: "Fix generated but verification failed",
           patchDiff: await getDiff(),
@@ -491,6 +646,8 @@ export async function runTriageAgent(
 
     return {
       success: true,
+      signature,
+      decision,
       rootCause: diagnosis.rootCause,
       fixSummary: parseFixSummary(rcaResult.finalResponse),
       patchDiff,
@@ -518,28 +675,39 @@ function parseDiagnosis(response: string): {
   affectedFiles: string[];
   confidence: "high" | "medium" | "low";
 } {
-  // Parse structured output from agent
-  // Expected format uses markdown headers or JSON blocks
+  // Parse structured output from agent with a strict schema (Zod)
+  // Fail fast if invalid JSON or missing fields
   // ...implementation
 }
 ```
 
 ### 3.0 CLI-First Default (`scripts/greenlit.sh`)
-This wrapper is the **default execution path** in CI. It runs `codex exec` non-interactively with strict guardrails and writes a report artifact.
+This wrapper is the **default execution path** in CI. It runs `codex exec` non-interactively with strict guardrails and writes a report artifact.  
+Note: `greenlit.yml` is **not** passed to Codex directly; it is parsed by Greenlit and mapped into Codex CLI overrides or `.codex/config.toml`.
+
+Example `.codex/config.toml`:
+
+```toml
+[sandbox]
+sandbox_mode = "workspace-write"
+shell_environment_policy = "filtered"
+network_access = "disabled"
+```
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Load config (guardrails, allowlist, diff limit)
+# Load Greenlit config (guardrails, allowlist, diff limit)
 CONFIG_FILE="${1:-greenlit.yml}"
 
 # Run Codex in non-interactive mode
 codex exec \
-  --sandbox workspace-write \
-  --approval-policy on-request \
-  --config "$CONFIG_FILE" \
-  --input "Run diagnosis → minimal fix → verification for CI failure"
+  --ask-for-approval on-request \
+  --config sandbox_mode="workspace-write" \
+  --config shell_environment_policy="filtered" \
+  --config network_access="disabled" \
+  --input "Run diagnosis -> minimal fix -> verification for CI failure"
 ```
 
 ### 3.2 Agent Prompts (`src/agent/prompts.ts`)
@@ -642,11 +810,19 @@ Generate a concise Root Cause Analysis report in markdown format.
 - **Job/Step**: [which step failed]
 - **Error**: [exact error message]
 
+## Decision
+- **Action**: [fix | report-only | quarantine]
+- **Reason**: [why this route was chosen]
+
 ## Root Cause
 [Why did this fail? Be specific]
 
 ## Fix Applied
 [What was changed and why]
+
+## Evidence
+- **File/Line**: [path:line]
+- **Excerpt**: [5-10 lines from logs]
 
 ## Verification
 - **Command**: ${verification.command}
@@ -668,10 +844,11 @@ Generate the RCA following this template exactly.
 ```
 
 ### 3.3 Verification Module (`src/agent/verifier.ts`)
+Verification is **hermetic**: install deps → run mapped command → capture output artifacts (junit/eslint/tsc when present).
 
 ```typescript
-import { Thread } from "@openai/codex-sdk";
-import { execSync, ExecSyncOptions } from "child_process";
+import { execFile } from "child_process";
+import type { FailureContext } from "../collector/context-builder";
 
 export interface VerificationResult {
   passed: boolean;
@@ -681,61 +858,59 @@ export interface VerificationResult {
 }
 
 export async function verifyFix(
-  originalCommand: string,
-  allowedCommands: string[],
-  thread: Thread
+  failureType: FailureContext["failureType"],
+  config: GreenlitConfig
 ): Promise<VerificationResult> {
-  // Validate command is in allowlist
-  const command = findAllowedCommand(originalCommand, allowedCommands);
+  const command = selectVerificationCommand(failureType, config.verification.command_map);
+  const install = config.verification.install_command;
+  const allowed = config.guardrails.allowed_commands;
 
-  if (!command) {
+  if (!command || !allowed.includes(command)) {
     return {
       passed: false,
-      command: originalCommand,
-      output: `Command not in allowlist: ${originalCommand}`,
+      command: command || "",
+      output: `Verification command not allowlisted for ${failureType}`,
       exitCode: -1
     };
   }
 
-  console.log(`  Running: ${command}`);
+  const outputChunks: string[] = [];
 
-  try {
-    const output = execSync(command, {
-      encoding: "utf-8",
-      timeout: 120000, // 2 minute timeout
-      maxBuffer: 10 * 1024 * 1024, // 10MB
-      stdio: ["pipe", "pipe", "pipe"]
+  const run = (cmd: string, args: string[] = []) =>
+    new Promise<number>((resolve, reject) => {
+      const child = execFile(cmd, args, { timeout: 120000 }, (err, stdout, stderr) => {
+        outputChunks.push(stdout || "");
+        outputChunks.push(stderr || "");
+        if (err) return reject(err);
+        resolve(0);
+      });
+      child?.stdout?.on("data", (d) => outputChunks.push(String(d)));
+      child?.stderr?.on("data", (d) => outputChunks.push(String(d)));
     });
 
-    return {
-      passed: true,
-      command,
-      output,
-      exitCode: 0
-    };
+  try {
+    if (install) {
+      const [cmd, ...args] = install.split(" ");
+      await run(cmd, args);
+    }
+    const [cmd, ...args] = command.split(" ");
+    await run(cmd, args);
+    return { passed: true, command, output: outputChunks.join(""), exitCode: 0 };
   } catch (error: any) {
     return {
       passed: false,
       command,
-      output: error.stdout + "\n" + error.stderr,
-      exitCode: error.status || 1
+      output: outputChunks.join(""),
+      exitCode: error?.code || 1
     };
   }
 }
 
-function findAllowedCommand(original: string, allowed: string[]): string | null {
-  // Match against allowlist patterns
-  for (const pattern of allowed) {
-    if (original.includes(pattern.replace(/\s+/g, " ").trim())) {
-      return pattern;
-    }
-    // Check if the failed command contains the allowed command
-    const baseCmd = pattern.split(" ")[0];
-    if (original.startsWith(baseCmd)) {
-      return pattern; // Use the allowed version
-    }
-  }
-  return null;
+function selectVerificationCommand(
+  failureType: FailureContext["failureType"],
+  commandMap: Record<string, string>
+): string | null {
+  return commandMap[failureType] || null;
 }
 ```
 
@@ -750,10 +925,12 @@ import { execSync } from "child_process";
 
 export async function createFixBranch(
   baseBranch: string,
-  branchPrefix: string
+  branchPrefix: string,
+  signature: string,
+  runId: number
 ): Promise<string> {
-  const timestamp = Date.now();
-  const branchName = `${branchPrefix}-${timestamp}`;
+  const shortSig = signature.slice(0, 8);
+  const branchName = `${branchPrefix}-${runId}-${shortSig}`;
 
   // Create and checkout new branch
   execSync(`git checkout -b ${branchName}`, { stdio: "pipe" });
@@ -764,6 +941,10 @@ export async function createFixBranch(
 export async function commitChanges(
   message: string
 ): Promise<string> {
+  execSync('git config user.name "greenlit-bot"', { stdio: "pipe" });
+  execSync('git config user.email "greenlit@users.noreply.github.com"', { stdio: "pipe" });
+  const status = execSync("git status --porcelain", { encoding: "utf-8" }).trim();
+  if (!status) throw new Error("No changes to commit");
   execSync("git add -A", { stdio: "pipe" });
   execSync(`git commit -m "${message}"`, { stdio: "pipe" });
 
@@ -799,11 +980,12 @@ export async function createPullRequest(
   baseBranch: string,
   headBranch: string,
   result: TriageResult,
+  signature: string,
   failureRunId: number,
   titleTemplate: string
 ): Promise<PRDetails> {
   const title = formatTitle(titleTemplate, result);
-  const body = formatPRBody(result, failureRunId, owner, repo);
+  const body = formatPRBody(result, signature, failureRunId, owner, repo);
 
   const { data: pr } = await octokit.rest.pulls.create({
     owner,
@@ -837,6 +1019,7 @@ function formatTitle(template: string, result: TriageResult): string {
 
 function formatPRBody(
   result: TriageResult,
+  signature: string,
   runId: number,
   owner: string,
   repo: string
@@ -845,6 +1028,8 @@ function formatPRBody(
 ## Greenlit Auto-Fix
 
 This PR was automatically generated by Greenlit to fix CI failure in run [#${runId}](https://github.com/${owner}/${repo}/actions/runs/${runId}).
+
+**Signature**: \`${signature}\`
 
 ---
 
@@ -857,6 +1042,9 @@ ${result.fixSummary}
 \`\`\`
 ${result.rootCause}
 \`\`\`
+
+### Decision
+- **Action**: ${result.decision}
 
 ### Fix Applied
 ${result.fixSummary}
@@ -919,14 +1107,17 @@ jobs:
   triage:
     name: Triage CI Failure
     runs-on: ubuntu-latest
-    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    if: ${{ github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.head_repository.fork == false }}
+    concurrency:
+      group: greenlit-${{ github.event.workflow_run.head_branch }}
+      cancel-in-progress: false
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
-          fetch-depth: 10
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -946,6 +1137,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "Missing OPENAI_API_KEY; exiting."
+            exit 1
+          fi
           greenlit triage \
             --run-id ${{ github.event.workflow_run.id }} \
             --repo ${{ github.repository }} \
@@ -972,6 +1167,18 @@ jobs:
             const result = ${{ steps.greenlit.outputs.result }};
             // Post diagnostic comment if auto-fix failed
             // ...
+
+  comment-only-fork:
+    name: Comment-Only for Forks
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.head_repository.fork == true }}
+    steps:
+      - name: Post comment with RCA only
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Post report-only comment for forked PRs
+            // No secrets, no code execution, no PRs
 ```
 
 ### 5.2 CLI Entry Point (`src/index.ts`)
@@ -1022,8 +1229,19 @@ program
     console.log(`🔍 Failure type: ${context.failureType}`);
     console.log(`📝 Error: ${context.errorSignature.slice(0, 100)}...`);
 
+    const signature = computeSignature(context);
+    const decision = routeFailure(context);
+    const canAttempt = checkSignatureLedger(signature, config);
+
+    if (!canAttempt || decision.action !== "fix") {
+      const result = buildReportOnlyResult(context, signature, decision);
+      fs.writeFileSync(options.output, JSON.stringify(result, null, 2));
+      return;
+    }
+
     console.log("\n🤖 Running Codex triage agent...");
-    const result = await runTriageAgent(context, config);
+    const result = await runTriageAgent(context, config, signature, "fix");
+    updateSignatureLedger(signature, result);
 
     // Write result
     fs.writeFileSync(options.output, JSON.stringify(result, null, 2));
@@ -1053,13 +1271,25 @@ program
       process.exit(1);
     }
 
+    if (config.behavior.require_verification && !result.verificationLog) {
+      console.log("❌ Verification required but missing");
+      process.exit(1);
+    }
+
+    if (result.confidence === "low") {
+      console.log("❌ Confidence too low to auto-PR; falling back to comment-only");
+      process.exit(1);
+    }
+
     const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
     const [owner, repo] = process.env.GITHUB_REPOSITORY!.split("/");
 
     // Create branch and commit
     const branchName = await createFixBranch(
       options.baseBranch,
-      config.output.branch_prefix
+      config.output.branch_prefix,
+      result.signature,
+      parseInt(process.env.GITHUB_RUN_ID || "0")
     );
 
     await commitChanges(`fix: ${result.fixSummary}\n\nGenerated by Greenlit`);
@@ -1073,6 +1303,7 @@ program
       options.baseBranch,
       branchName,
       result,
+      result.signature,
       parseInt(process.env.GITHUB_RUN_ID || "0"),
       config.output.pr_title_template
     );
@@ -1145,11 +1376,16 @@ test("divide works", () => {
 | No Dependencies | Forbid `package-lock.json`, `yarn.lock` changes by default |
 | Branch-Only | Creates PR, never pushes to main/protected branches |
 | Sandbox Mode | Codex runs with `workspace-write` sandbox |
+| Fork-Safe Mode | Forks or missing secrets run comment-only |
+| Signature Dedupe | Block repeated attempts per signature window |
+| Env Policy | Filter shell environment, drop `*_TOKEN`, `*_KEY` |
+| Network | Disabled by default unless needed for builds |
 
 ### 7.2 Security Considerations
 
 ```typescript
 // src/config/security.ts
+import picomatch from "picomatch";
 
 export function validatePatch(diff: string, config: GreenlitConfig): boolean {
   const lines = diff.split("\n");
@@ -1159,11 +1395,12 @@ export function validatePatch(diff: string, config: GreenlitConfig): boolean {
     throw new Error(`Patch too large: ${lines.length} lines`);
   }
 
-  // Check for forbidden patterns
-  for (const pattern of config.guardrails.forbidden_patterns) {
-    const regex = new RegExp(pattern.replace("*", ".*"));
-    if (diff.match(regex)) {
-      throw new Error(`Patch modifies forbidden pattern: ${pattern}`);
+  // Check for forbidden patterns using glob matching
+  const isForbidden = picomatch(config.guardrails.forbidden_patterns);
+  const touchedFiles = extractTouchedFiles(diff);
+  for (const file of touchedFiles) {
+    if (isForbidden(file)) {
+      throw new Error(`Patch modifies forbidden file: ${file}`);
     }
   }
 
@@ -1184,6 +1421,15 @@ export function validatePatch(diff: string, config: GreenlitConfig): boolean {
 
   return true;
 }
+
+function extractTouchedFiles(diff: string): string[] {
+  // TODO: parse diff headers (---/+++ lines) and return file paths
+  return [];
+}
+
+// Additionally enforce a filtered shell environment in Codex config:
+// - allow only PATH, HOME, and toolchain vars
+// - exclude *_TOKEN, *_KEY, *_SECRET
 ```
 
 ---
@@ -1197,14 +1443,16 @@ export function validatePatch(diff: string, config: GreenlitConfig): boolean {
 | 3 | CLI wrapper | `scripts/greenlit.sh` using `codex exec` |
 | 4 | GitHub logs collector | `collectFailureContext()` working |
 | 5 | Context builder | `buildFailureContext()` with classification |
-| 6 | Prompts & parsing | Prompts for diagnosis/fix/verification |
-| 7 | Optional SDK orchestrator | `runTriageAgent()` for advanced runs |
-| 8 | Verifier module | `verifyFix()` with allowlist |
-| 9 | PR publisher | Branch creation, PR with RCA body |
-| 10 | CLI entry point | `greenlit triage` + `greenlit publish` |
-| 11 | GitHub Action | `greenlit.yml` workflow |
-| 12 | Demo repo | Intentional failure test case |
-| 13 | End-to-end test | Full red→green demo working |
+| 6 | Routing + signature ledger | `routeFailure()` + dedupe rules |
+| 7 | Evidence pack | Minimal excerpt + file/line extraction |
+| 8 | Prompts & parsing | Prompts for diagnosis/fix/verification |
+| 9 | Optional SDK orchestrator | `runTriageAgent()` for advanced runs |
+| 10 | Hermetic verifier | Install + run + output capture |
+| 11 | PR publisher | Branch creation, PR with RCA body |
+| 12 | CLI entry point | `greenlit triage` + `greenlit publish` |
+| 13 | GitHub Action | `greenlit.yml` workflow |
+| 14 | Demo repo | Intentional failure test case |
+| 15 | End-to-end test | Full red→green demo working |
 
 ---
 
@@ -1222,9 +1470,9 @@ export function validatePatch(diff: string, config: GreenlitConfig): boolean {
 
 ## Stretch Goals (Post-MVP)
 
-1. **Evidence Panel**: Show exact file:line + log excerpt that led to fix
-2. **Fix Candidate Ranking**: Generate 2-3 candidates, apply highest confidence
-3. **Flake Detection**: Identify flaky tests and quarantine them
+1. **Fix Candidate Ranking**: Generate 2-3 candidates, apply highest confidence
+2. **Flake Quarantine Automation**: Auto-create issues and disable tests with labels
+3. **Org-Level Analytics**: Signature success rates + most common failures
 4. **MCP Tool**: Expose as MCP server so other agents can invoke Greenlit
 5. **VS Code Integration**: Use App Server for IDE feedback
 
@@ -1235,13 +1483,14 @@ export function validatePatch(diff: string, config: GreenlitConfig): boolean {
 ```
 1. src/agent/orchestrator.ts     ← Core logic
 2. src/agent/prompts.ts          ← Agent instructions
-3. src/collector/github-logs.ts  ← CI integration
-4. src/index.ts                  ← CLI entry
-5. .github/workflows/greenlit.yml ← Action trigger
+3. src/agent/routing.ts          ← Fix vs report-only decisioning
+4. src/collector/github-logs.ts  ← CI integration
+5. src/index.ts                  ← CLI entry
+6. .github/workflows/greenlit.yml ← Action trigger
 ```
 
 ---
 
 ## One-Liner Pitch
 
-> **Greenlit** auto-triages failing CI runs using Codex SDK, generates minimal verified patches, and ships fix PRs with root cause analysis—turning red builds green with evidence.
+> **Greenlit** auto-triages failing CI runs using Codex CLI, routes failures safely, generates minimal verified patches, and ships fix PRs with evidence—turning red builds green fast.

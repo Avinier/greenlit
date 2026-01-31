@@ -1,0 +1,45 @@
+{
+  "name": "@greenlit/cli",
+  "version": "0.1.0",
+  "description": "Automated CI failure triage agent - turns red builds green with evidence",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "greenlit": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "test": "vitest",
+    "lint": "eslint src/",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "ci",
+    "github-actions",
+    "automation",
+    "codex",
+    "openai"
+  ],
+  "author": "Greenlit Team",
+  "license": "MIT",
+  "dependencies": {
+    "@octokit/rest": "^20.0.0",
+    "@octokit/webhooks-types": "^7.3.0",
+    "chalk": "^5.3.0",
+    "commander": "^12.0.0",
+    "openai": "^4.0.0",
+    "yaml": "^2.3.0",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.0",
+    "vitest": "^1.2.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
