@@ -1,0 +1,52 @@
+name: Greenlit Action Smoke
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke:
+    name: Build and validate action
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build
+        run: npm run build
+
+      - name: Validate action metadata
+        run: |
+          node - <<'NODE'
+          const fs = require("fs");
+          const yaml = require("yaml");
+          const data = yaml.parse(fs.readFileSync("action.yml", "utf8"));
+          const requiredInputs = [
+            "github-token",
+            "openai-api-key",
+            "run-id",
+            "repo",
+            "branch",
+            "sha",
+            "base-branch"
+          ];
+          if (!data || data.runs?.using !== "composite") {
+            throw new Error("action.yml is missing runs.using: composite");
+          }
+          const inputs = data.inputs || {};
+          for (const key of requiredInputs) {
+            if (!inputs[key]) {
+              throw new Error(`action.yml missing input: ${key}`);
+            }
+          }
+          console.log("action.yml looks valid");
+NODE

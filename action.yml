@@ -1,0 +1,110 @@
+name: Greenlit CI Triage
+description: Turn CI failures into Failure Cards with routing and optional fixes.
+inputs:
+  github-token:
+    description: GitHub token used to read logs and post comments/PRs.
+    required: true
+  openai-api-key:
+    description: OpenAI API key used by the agent.
+    required: true
+  run-id:
+    description: GitHub Actions run ID.
+    required: true
+  repo:
+    description: Repository in owner/repo format.
+    required: true
+  branch:
+    description: Branch name for the failing run.
+    required: true
+  sha:
+    description: Commit SHA for the failing run.
+    required: true
+  base-branch:
+    description: Base branch for PRs and comments.
+    required: true
+  config:
+    description: Path to greenlit.yml config in the target repo.
+    default: greenlit.yml
+  output:
+    description: Output JSON path for triage results.
+    default: greenlit-result.json
+  publish:
+    description: Whether to publish a Failure Card/PR after triage.
+    default: "true"
+  comment-only:
+    description: Post a comment only, do not create PRs.
+    default: "false"
+outputs:
+  success:
+    description: Whether a fix was generated.
+  result-path:
+    description: Path to the result JSON file.
+  rca-path:
+    description: Path to the RCA markdown file.
+  signature:
+    description: Failure signature hash.
+runs:
+  using: composite
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+    - name: Install Greenlit
+      shell: bash
+      run: npm install
+      working-directory: ${{ github.action_path }}
+    - name: Build Greenlit
+      shell: bash
+      run: npm run build
+      working-directory: ${{ github.action_path }}
+    - name: Run Greenlit triage
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        OPENAI_API_KEY: ${{ inputs.openai-api-key }}
+        OUTPUT_PATH: ${{ inputs.output }}
+      run: |
+        set -euo pipefail
+        node "${{ github.action_path }}/dist/index.js" triage \
+          --run-id "${{ inputs.run-id }}" \
+          --repo "${{ inputs.repo }}" \
+          --branch "${{ inputs.branch }}" \
+          --sha "${{ inputs.sha }}" \
+          --output "${{ inputs.output }}" \
+          --config "${{ inputs.config }}" || true
+
+        if [[ ! -f "${{ inputs.output }}" ]]; then
+          echo "Greenlit triage did not produce ${OUTPUT_PATH}" >&2
+          exit 1
+        fi
+
+        node - <<'NODE'
+        const fs = require("fs");
+        const path = process.env.OUTPUT_PATH;
+        const data = JSON.parse(fs.readFileSync(path, "utf8"));
+        const success = data.success ? "true" : "false";
+        const signature = data.signature || "";
+        const rcaPath = path.replace(/\.json$/, "-rca.md");
+        const out = process.env.GITHUB_OUTPUT;
+        fs.appendFileSync(out, `success=${success}\n`);
+        fs.appendFileSync(out, `result-path=${path}\n`);
+        fs.appendFileSync(out, `rca-path=${rcaPath}\n`);
+        fs.appendFileSync(out, `signature=${signature}\n`);
+NODE
+    - name: Publish Failure Card or PR
+      if: ${{ inputs.publish == 'true' }}
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        extra=""
+        if [[ "${{ inputs.comment-only }}" == "true" ]]; then
+          extra="--comment-only"
+        fi
+        node "${{ github.action_path }}/dist/index.js" publish \
+          --result "${{ inputs.output }}" \
+          --base-branch "${{ inputs.base-branch }}" \
+          --config "${{ inputs.config }}" \
+          $extra || true

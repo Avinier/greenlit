@@ -44,7 +44,7 @@ behavior:
   require_verification: true
 ```
 
-## GitHub Actions setup
+## GitHub Action setup (recommended)
 
 `.github/workflows/greenlit.yml`
 
@@ -70,28 +70,16 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 10
-      - uses: actions/setup-node@v4
+      - name: Run Greenlit
+        uses: avinier/greenlit@v1
         with:
-          node-version: "20"
-      - run: npm ci && npm run build
-      - name: Run Greenlit Triage
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: |
-          node dist/index.js triage \
-            --run-id ${{ github.event.workflow_run.id }} \
-            --repo ${{ github.repository }} \
-            --branch ${{ github.event.workflow_run.head_branch }} \
-            --sha ${{ github.event.workflow_run.head_sha }}
-      - name: Publish Failure Card
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          node dist/index.js publish \
-            --result greenlit-result.json \
-            --base-branch ${{ github.event.repository.default_branch }} \
-            --comment-only
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          run-id: ${{ github.event.workflow_run.id }}
+          repo: ${{ github.repository }}
+          branch: ${{ github.event.workflow_run.head_branch }}
+          sha: ${{ github.event.workflow_run.head_sha }}
+          base-branch: ${{ github.event.workflow_run.head_branch }}
 ```
 
 Required secrets: `OPENAI_API_KEY` (and `GITHUB_TOKEN` is provided by GitHub Actions).
