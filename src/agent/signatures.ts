@@ -18,16 +18,27 @@ export interface SignatureLedger {
 }
 
 export function computeSignature(context: FailureContext): string {
+  const normalizedError = normalizeErrorSignature(context.errorSignature);
   const payload = [
     context.repo,
     context.failureType,
-    context.errorSignature,
+    normalizedError,
     context.failedCommand,
     context.evidence?.job || "",
     context.evidence?.step || ""
   ].join("|");
 
   return createHash("sha256").update(payload).digest("hex");
+}
+
+function normalizeErrorSignature(signature: string): string {
+  return signature
+    .replace(/\d+/g, "N") // Replace numbers
+    .replace(/0x[a-f0-9]+/gi, "X") // Replace hex addresses
+    .replace(/\/[\w\-\.\/]+\//g, "/PATH/") // Replace paths
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
 }
 
 export function loadSignatureLedger(filePath: string): SignatureLedger {

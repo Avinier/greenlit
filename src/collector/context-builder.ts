@@ -111,17 +111,27 @@ function classifyFailureType(logs: string, jobs: FailedJob[]): FailureType {
 function classifyFailureClass(logs: string, jobs: FailedJob[]): FailureClass {
   const lowerLogs = logs.toLowerCase();
 
-  // Check for secrets/permissions issues
-  const secretsPatterns = [
+  // Check for permissions issues
+  const permissionsPatterns = [
     /permission denied/i,
+    /insufficient permissions?/i,
+    /insufficient scopes?/i,
     /resource not accessible/i,
-    /missing required secret/i,
-    /unable to resolve credentials/i,
+    /resource not accessible by integration/i,
     /authentication failed/i,
     /401 unauthorized/i,
     /403 forbidden/i,
-    /EACCES/i,
-    /secret .* not found/i
+    /eacces/i
+  ];
+  if (permissionsPatterns.some(p => p.test(lowerLogs))) {
+    return "permissions";
+  }
+
+  // Check for secrets issues
+  const secretsPatterns = [
+    /missing required secret/i,
+    /secret .* not found/i,
+    /unable to resolve credentials/i
   ];
   if (secretsPatterns.some(p => p.test(lowerLogs))) {
     return "secrets";
@@ -245,32 +255,43 @@ function extractFailedCommand(jobs: FailedJob[], logs: string): string {
   // Try to find from step names
   for (const job of jobs) {
     for (const step of job.failedSteps) {
-      if (step.stepName.toLowerCase().includes("run")) {
-        // Try to extract command from step name like "Run npm test"
-        const cmdMatch = step.stepName.match(/Run (.+)/i);
-        if (cmdMatch) return cmdMatch[1];
-      }
+      const cmdFromStep = extractCommandFromText(step.stepName);
+      if (cmdFromStep) return cmdFromStep;
     }
   }
 
   // Try to extract from logs
-  const cmdPatterns = [
-    /npm (?:run )?\w+/,
-    /yarn (?:run )?\w+/,
-    /pnpm (?:run )?\w+/,
-    /pytest.*$/m,
-    /cargo test.*$/m,
-    /go test.*$/m,
-    /jest.*$/m,
-    /vitest.*$/m
+  const cmdFromLogs = extractCommandFromText(logs);
+  if (cmdFromLogs) return cmdFromLogs;
+
+  return "unknown";
+}
+
+function extractCommandFromText(text: string): string | null {
+  const patterns: RegExp[] = [
+    /(?:^|\n)\s*(?:\$|>|\w+@\w+)?\s*(npm\s+run\s+[\w:-]+)/i,
+    /(?:^|\n)\s*(?:\$|>|\w+@\w+)?\s*(npm\s+test)/i,
+    /(?:^|\n)\s*(?:\$|>|\w+@\w+)?\s*(npm\s+run\s+lint)/i,
+    /(?:^|\n)\s*(?:\$|>|\w+@\w+)?\s*(npm\s+run\s+build)/i,
+    /(?:^|\n)\s*(?:\$|>|\w+@\w+)?\s*(npm\s+run\s+typecheck)/i,
+    /(?:^|\n)\s*(?:\$|>|\w+@\w+)?\s*(yarn\s+test[^\n]*)/i,
+    /(?:^|\n)\s*(?:\$|>|\w+@\w+)?\s*(pnpm\s+test[^\n]*)/i,
+    /(?:^|\n)\s*(?:\$|>|\w+@\w+)?\s*(yarn\s+run\s+[\w:-]+)/i,
+    /(?:^|\n)\s*(?:\$|>|\w+@\w+)?\s*(pnpm\s+run\s+[\w:-]+)/i,
+    /(?:^|\n)\s*(?:\$|>|\w+@\w+)?\s*(pytest[^\n]*)/i,
+    /(?:^|\n)\s*(?:\$|>|\w+@\w+)?\s*(cargo\s+test[^\n]*)/i,
+    /(?:^|\n)\s*(?:\$|>|\w+@\w+)?\s*(go\s+test[^\n]*)/i,
+    /(?:^|\n)\s*(?:\$|>|\w+@\w+)?\s*(jest[^\n]*)/i,
+    /(?:^|\n)\s*(?:\$|>|\w+@\w+)?\s*(vitest[^\n]*)/i,
+    /run\s+((?:npm|yarn|pnpm)\s+(?:run\s+)?[\w:-]+)/i
   ];
 
-  for (const pattern of cmdPatterns) {
-    const match = logs.match(pattern);
-    if (match) return match[0];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match?.[1]) return match[1].trim();
   }
 
-  return "npm test"; // Default fallback
+  return null;
 }
 
 /**

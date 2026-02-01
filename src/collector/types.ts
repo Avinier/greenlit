@@ -35,7 +35,7 @@ export type FailureType =
 export type FailureClass =
   | "deterministic"     // Code failure that can be fixed
   | "flaky"             // Intermittent failure
-  | "secrets"           // Missing secrets/permissions
+  | "secrets"           // Missing secrets
   | "permissions"       // Access control issues
   | "infra_outage"      // External service down
   | "dependency_registry" // npm/pypi/etc down

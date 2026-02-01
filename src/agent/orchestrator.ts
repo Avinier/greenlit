@@ -1,4 +1,6 @@
 import OpenAI from "openai";
+import fs from "fs";
+import path from "path";
 import type { FailureContext, TriageResult, VerificationResult } from "../collector/types.js";
 import type { GreenlitConfig } from "../config/greenlit.config.js";
 import { PROMPTS, parseDiagnosis, type Diagnosis } from "./prompts.js";
@@ -70,7 +72,14 @@ export async function runTriageAgent(
     // ─────────────────────────────────────────────────────────────
     console.log("\n🔧 Phase 2: Generating fix...");
 
-    await generateFix(diagnosis, config.guardrails);
+    const allowedFiles = normalizeAllowedFiles(
+      diagnosis.affectedFiles.length ? diagnosis.affectedFiles : context.relevantFiles
+    );
+    if (!allowedFiles.length) {
+      console.log("   ⚠️  No allowed files identified; file updates will be blocked for safety.");
+    }
+
+    await generateFix(diagnosis, config.guardrails, allowedFiles);
 
     // Get and validate the diff
     let patchDiff = getCurrentDiff();
@@ -95,12 +104,41 @@ export async function runTriageAgent(
       };
     }
 
+    const fileValidation = validateDiffFiles(patchDiff, allowedFiles);
+    if (!fileValidation.valid) {
+      console.log(`   ⚠️  Patch file validation failed: ${fileValidation.reason}`);
+      execSync("git checkout .", { stdio: "pipe" });
+      return {
+        success: false,
+        rootCause: diagnosis.rootCause,
+        fixSummary: `Patch rejected: ${fileValidation.reason}`,
+        patchDiff: "",
+        verificationLog: "",
+        confidence: "low",
+        routingDecision: context.routingDecision
+      };
+    }
+
     console.log(`   Patch size: ${patchDiff.split("\n").length} lines`);
 
     // ─────────────────────────────────────────────────────────────
     // PHASE 3: Verify Fix
     // ─────────────────────────────────────────────────────────────
     console.log("\n✅ Phase 3: Verifying fix...");
+
+    if (!context.failedCommand || context.failedCommand === "unknown") {
+      console.log("   ❌ Unable to determine failed command for verification");
+      execSync("git checkout .", { stdio: "pipe" });
+      return {
+        success: false,
+        rootCause: diagnosis.rootCause,
+        fixSummary: "Fix generated but failed command could not be determined for verification",
+        patchDiff,
+        verificationLog: "Failed command could not be determined from logs or steps.",
+        confidence: "low",
+        routingDecision: context.routingDecision
+      };
+    }
 
     let verificationResult = await verifyFix(
       context.failedCommand,
@@ -113,7 +151,7 @@ export async function runTriageAgent(
       console.log("   ⚠️  Verification failed, attempting retry...");
 
       for (let attempt = 1; attempt <= config.behavior.max_retries; attempt++) {
-        await retryFix(verificationResult.output, attempt);
+        await retryFix(verificationResult.output, attempt, allowedFiles);
         patchDiff = getCurrentDiff();
 
         const retryValidation = validatePatch(
@@ -124,6 +162,12 @@ export async function runTriageAgent(
 
         if (!retryValidation.valid) {
           console.log(`   ⚠️  Retry patch validation failed: ${retryValidation.reason}`);
+          continue;
+        }
+
+        const retryFileValidation = validateDiffFiles(patchDiff, allowedFiles);
+        if (!retryFileValidation.valid) {
+          console.log(`   ⚠️  Retry patch file validation failed: ${retryFileValidation.reason}`);
           continue;
         }
 
@@ -214,12 +258,20 @@ async function runDiagnosis(context: FailureContext): Promise<Diagnosis> {
 /**
  * Generate fix using OpenAI with tool use for file editing
  */
-async function generateFix(diagnosis: Diagnosis, guardrails: GreenlitConfig["guardrails"]): Promise<void> {
+async function generateFix(
+  diagnosis: Diagnosis,
+  guardrails: GreenlitConfig["guardrails"],
+  allowedFiles: string[]
+): Promise<void> {
   // Read the affected files first
   const fileContents: Record<string, string> = {};
   for (const file of diagnosis.affectedFiles) {
+    if (!isAllowedFilePath(file, allowedFiles)) {
+      console.log(`   Skipping unsafe or disallowed file read: ${file}`);
+      continue;
+    }
     try {
-      const content = execSync(`cat "${file}"`, { encoding: "utf-8" });
+      const content = fs.readFileSync(file, "utf-8");
       fileContents[file] = content;
     } catch {
       console.log(`   Warning: Could not read ${file}`);
@@ -253,14 +305,16 @@ async function generateFix(diagnosis: Diagnosis, guardrails: GreenlitConfig["gua
     const filePath = match[1].trim();
     const fileContent = match[2];
 
-    if (diagnosis.affectedFiles.some(f => filePath.includes(f) || f.includes(filePath))) {
-      try {
-        const { writeFileSync } = await import("fs");
-        writeFileSync(filePath, fileContent);
-        console.log(`   Updated: ${filePath}`);
-      } catch (err) {
-        console.log(`   Failed to write ${filePath}: ${err}`);
-      }
+    if (!isAllowedFilePath(filePath, allowedFiles)) {
+      console.log(`   Skipping unsafe or disallowed file update: ${filePath}`);
+      continue;
+    }
+
+    try {
+      fs.writeFileSync(filePath, fileContent);
+      console.log(`   Updated: ${filePath}`);
+    } catch (err) {
+      console.log(`   Failed to write ${filePath}: ${err}`);
     }
   }
 }
@@ -268,7 +322,11 @@ async function generateFix(diagnosis: Diagnosis, guardrails: GreenlitConfig["gua
 /**
  * Retry fix after verification failure
  */
-async function retryFix(failureOutput: string, attempt: number): Promise<void> {
+async function retryFix(
+  failureOutput: string,
+  attempt: number,
+  allowedFiles: string[]
+): Promise<void> {
   const response = await openai.chat.completions.create({
     model: "gpt-4o",
     messages: [
@@ -290,13 +348,106 @@ async function retryFix(failureOutput: string, attempt: number): Promise<void> {
     const fileContent = match[2];
 
     try {
-      const { writeFileSync } = await import("fs");
-      writeFileSync(filePath, fileContent);
+      if (!isAllowedFilePath(filePath, allowedFiles)) {
+        console.log(`   Skipping unsafe or disallowed retry update: ${filePath}`);
+        continue;
+      }
+      fs.writeFileSync(filePath, fileContent);
       console.log(`   Retry updated: ${filePath}`);
     } catch (err) {
       console.log(`   Retry failed to write ${filePath}: ${err}`);
     }
   }
+}
+
+function normalizeAllowedFiles(files: string[]): string[] {
+  const normalized = files
+    .map(f => normalizeFilePath(f))
+    .filter(f => f && f !== ".")
+    .filter(f => isSafeRelativePath(f));
+  return [...new Set(normalized)];
+}
+
+function normalizeFilePath(filePath: string): string {
+  const trimmed = filePath.trim().replace(/\\/g, "/");
+  const normalized = path.posix.normalize(trimmed);
+  return normalized.replace(/^\.\/+/, "");
+}
+
+function isSafeRelativePath(filePath: string): boolean {
+  if (!filePath || filePath === ".") return false;
+  if (path.isAbsolute(filePath)) return false;
+  const parts = filePath.split("/");
+  return !parts.some(part => part === "..");
+}
+
+function isAllowedFilePath(filePath: string, allowedFiles: string[]): boolean {
+  if (!allowedFiles.length) return false;
+  const normalized = normalizeFilePath(filePath);
+  if (!isSafeRelativePath(normalized)) return false;
+  return allowedFiles.includes(normalized);
+}
+
+function extractDiffFiles(diff: string): {
+  files: string[];
+  hasDeletions: boolean;
+  hasRenames: boolean;
+} {
+  const files = new Set<string>();
+  let hasDeletions = false;
+  let hasRenames = false;
+
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("rename from ") || line.startsWith("rename to ")) {
+      hasRenames = true;
+      continue;
+    }
+    if (line.startsWith("+++ ")) {
+      const target = line.slice(4).trim();
+      if (target === "/dev/null") {
+        hasDeletions = true;
+        continue;
+      }
+      const cleaned = target.startsWith("b/") ? target.slice(2) : target;
+      const normalized = normalizeFilePath(cleaned);
+      if (normalized && normalized !== ".") {
+        files.add(normalized);
+      }
+    }
+  }
+
+  return { files: [...files], hasDeletions, hasRenames };
+}
+
+function validateDiffFiles(diff: string, allowedFiles: string[]): { valid: boolean; reason?: string } {
+  const { files, hasDeletions, hasRenames } = extractDiffFiles(diff);
+
+  if (hasDeletions) {
+    return { valid: false, reason: "Patch deletes files, which is not allowed" };
+  }
+  if (hasRenames) {
+    return { valid: false, reason: "Patch renames files, which is not allowed" };
+  }
+  if (!files.length) {
+    return { valid: true };
+  }
+  if (!allowedFiles.length) {
+    return {
+      valid: false,
+      reason: "No allowed files were provided to validate patch paths"
+    };
+  }
+
+  for (const file of files) {
+    if (!isSafeRelativePath(file)) {
+      return { valid: false, reason: `Unsafe file path detected: ${file}` };
+    }
+    if (!allowedFiles.includes(file)) {
+      return { valid: false, reason: `Patch modifies disallowed file: ${file}` };
+    }
+  }
+
+  return { valid: true };
 }
 
 /**
@@ -318,7 +469,59 @@ async function generateRCA(
     max_tokens: 1500
   });
 
-  return response.choices[0]?.message?.content || diagnosis.suggestedFix || "Fix applied";
+  const candidate =
+    response.choices[0]?.message?.content?.trim() ||
+    diagnosis.suggestedFix ||
+    "Fix applied";
+
+  if (isValidRca(candidate)) {
+    return candidate;
+  }
+
+  return buildRcaFallback(diagnosis, verification, context);
+}
+
+function isValidRca(content: string): boolean {
+  const requiredHeadings = [
+    "## Summary",
+    "## Failure Signature",
+    "## Root Cause",
+    "## Fix Applied",
+    "## Verification"
+  ];
+
+  return requiredHeadings.every(heading => {
+    const pattern = new RegExp(`^${heading}\\b`, "mi");
+    return pattern.test(content);
+  });
+}
+
+function buildRcaFallback(
+  diagnosis: Diagnosis,
+  verification: VerificationResult,
+  context: FailureContext
+): string {
+  const jobStep = [context.evidence?.job, context.evidence?.step].filter(Boolean).join(" / ");
+  const errorLine = context.errorSignature.split("\n")[0]?.trim() || "Unknown error";
+  const fixSummary = diagnosis.suggestedFix || "Applied minimal fix to address failure.";
+
+  return `## Summary
+Resolved the CI failure with a minimal targeted change.
+
+## Failure Signature
+- **Job/Step**: ${jobStep || "Unknown"}
+- **Error**: ${errorLine}
+
+## Root Cause
+${diagnosis.rootCause || "Root cause could not be determined from available data."}
+
+## Fix Applied
+${fixSummary}
+
+## Verification
+- **Command**: \`${verification.command}\`
+- **Result**: ${verification.passed ? "✅ PASSED" : "❌ FAILED"}
+`;
 }
 
 /**

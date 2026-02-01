@@ -123,13 +123,14 @@ export async function getRunAnnotations(
   octokit: Octokit,
   owner: string,
   repo: string,
-  runId: number
+  runId: number,
+  ref: string
 ): Promise<Array<{ level: string; message: string; path?: string; line?: number }>> {
   try {
     const { data: checkRuns } = await octokit.rest.checks.listForRef({
       owner,
       repo,
-      ref: `refs/heads/main`, // Will need to parameterize
+      ref,
       filter: "latest"
     });
 

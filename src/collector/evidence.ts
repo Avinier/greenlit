@@ -9,7 +9,7 @@ export interface EvidencePack {
 }
 
 const FILE_LINE_PATTERN =
-  /([^\s:]+?\.(?:[jt]sx?|py|go|rs|java|cs|cpp|c|rb|php|kt|swift|scala)):(\d+)(?::\d+)?/;
+  /([^\s:]+?\.(?:[jt]sx?|py|go|rs|java|cs|cpp|c|rb|php|kt|swift|scala)):(\d+)(?::\d+)?/g;
 
 /**
  * Build a small evidence pack from logs and failed job metadata.
@@ -17,14 +17,14 @@ const FILE_LINE_PATTERN =
 export function buildEvidencePack(logs: string, failedJobs: FailedJob[]): EvidencePack {
   const evidence: EvidencePack = {};
 
-  const match = logs.match(FILE_LINE_PATTERN);
-  if (match) {
-    evidence.file = match[1];
-    evidence.line = match[2];
+  const logLines = logs.split("\n");
+  const bestMatch = findBestFileLineMatch(logLines);
+  if (bestMatch) {
+    evidence.file = bestMatch.file;
+    evidence.line = bestMatch.line;
   }
 
-  const logLines = logs.split("\n");
-  const excerpt = extractExcerpt(logLines, match?.[0]);
+  const excerpt = extractExcerpt(logLines, bestMatch?.matchedText);
   if (excerpt) {
     evidence.excerpt = excerpt;
   }
@@ -36,6 +36,43 @@ export function buildEvidencePack(logs: string, failedJobs: FailedJob[]): Eviden
   }
 
   return evidence;
+}
+
+function findBestFileLineMatch(
+  lines: string[]
+): { file: string; line: string; matchedText: string } | undefined {
+  const matches: Array<{ file: string; line: string; matchedText: string; score: number }> = [];
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    const lineMatches = [...line.matchAll(FILE_LINE_PATTERN)];
+    if (!lineMatches.length) continue;
+
+    const score = scoreEvidenceWindow(lines, i);
+    for (const match of lineMatches) {
+      matches.push({
+        file: match[1],
+        line: match[2],
+        matchedText: match[0],
+        score
+      });
+    }
+  }
+
+  if (!matches.length) return undefined;
+
+  matches.sort((a, b) => b.score - a.score);
+  return matches[0];
+}
+
+function scoreEvidenceWindow(lines: string[], index: number): number {
+  const windowStart = Math.max(index - 2, 0);
+  const windowEnd = Math.min(index + 3, lines.length);
+  const window = lines.slice(windowStart, windowEnd).join("\n");
+  const keywords = /(error|fail|failed|exception|traceback|panic)/gi;
+  const matches = window.match(keywords);
+  const keywordScore = matches ? matches.length : 0;
+  return 1 + keywordScore;
 }
 
 function extractExcerpt(lines: string[], matchedLine?: string): string | undefined {
