@@ -62,6 +62,12 @@ ${context.changedFiles.map(f => `- ${f}`).join("\n") || "- (none detected)"}
 ## Files Mentioned in Error Logs
 ${context.relevantFiles.map(f => `- ${f}`).join("\n") || "- (none detected)"}
 
+## Evidence Pack
+${context.evidence?.file ? `- **File**: ${context.evidence.file}` : "- **File**: (not detected)"}
+${context.evidence?.line ? `- **Line**: ${context.evidence.line}` : "- **Line**: (not detected)"}
+${context.evidence?.job ? `- **Job**: ${context.evidence.job}` : "- **Job**: (not detected)"}
+${context.evidence?.step ? `- **Step**: ${context.evidence.step}` : "- **Step**: (not detected)"}
+
 ## Recent Commits
 ${context.recentCommits.join("\n") || "(none)"}
 

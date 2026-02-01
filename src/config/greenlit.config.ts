@@ -36,7 +36,8 @@ const RoutingSchema = z.object({
   fix_attempt: z.array(z.string()).default([
     "test", "lint", "typecheck", "build"
   ]),
-  flake_workflow: z.array(z.string()).default(["flaky"])
+  flake_workflow: z.array(z.string()).default(["flaky"]),
+  max_attempts_per_signature: z.number().default(2)
 });
 
 const OutputSchema = z.object({
@@ -44,12 +45,18 @@ const OutputSchema = z.object({
   branch_prefix: z.string().default("greenlit/fix")
 });
 
+const SignatureLedgerSchema = z.object({
+  path: z.string().default("data/signatures.json"),
+  ttl_days: z.number().default(30)
+});
+
 const ConfigSchema = z.object({
   version: z.number().default(1),
   guardrails: GuardrailsSchema.default({}),
   behavior: BehaviorSchema.default({}),
   routing: RoutingSchema.default({}),
-  output: OutputSchema.default({})
+  output: OutputSchema.default({}),
+  signature_ledger: SignatureLedgerSchema.default({})
 });
 
 export type GreenlitConfig = z.infer<typeof ConfigSchema>;
@@ -57,6 +64,7 @@ export type Guardrails = z.infer<typeof GuardrailsSchema>;
 export type Behavior = z.infer<typeof BehaviorSchema>;
 export type Routing = z.infer<typeof RoutingSchema>;
 export type Output = z.infer<typeof OutputSchema>;
+export type SignatureLedgerConfig = z.infer<typeof SignatureLedgerSchema>;
 
 /**
  * Load and validate configuration from a YAML file
