@@ -1,13 +1,86 @@
-import OpenAI from "openai";
-import fs from "fs";
 import path from "path";
 import type { FailureContext, TriageResult, VerificationResult } from "../collector/types.js";
 import type { GreenlitConfig } from "../config/greenlit.config.js";
 import { PROMPTS, parseDiagnosis, type Diagnosis } from "./prompts.js";
 import { verifyFix, validatePatch, getCurrentDiff } from "./verifier.js";
 import { execSync } from "child_process";
+import { Codex } from "@openai/codex-sdk";
 
-const openai = new OpenAI();
+type CodexThread = {
+  run: (prompt: string) => Promise<unknown>;
+  id?: string;
+  threadId?: string;
+};
+
+function buildPrompt(taskPrompt: string): string {
+  return `${PROMPTS.system}\n\n${taskPrompt}`.trim();
+}
+
+async function startCodexThread(): Promise<CodexThread> {
+  const codex = new Codex();
+  const thread = await Promise.resolve(codex.startThread());
+  return thread as CodexThread;
+}
+
+function getThreadId(thread: CodexThread): string | undefined {
+  const candidate = (thread as { id?: unknown; threadId?: unknown }).id ??
+    (thread as { threadId?: unknown }).threadId;
+  return typeof candidate === "string" ? candidate : undefined;
+}
+
+function coerceCodexText(result: unknown): string {
+  if (typeof result === "string") return result;
+  if (!result) return "";
+  if (typeof result === "object") {
+    const record = result as Record<string, unknown>;
+    if (typeof record.content === "string") return record.content;
+    if (typeof record.message === "string") return record.message;
+    if (typeof record.output === "string") return record.output;
+    if (typeof record.text === "string") return record.text;
+    if (typeof record.structuredContent === "string") return record.structuredContent;
+    if (
+      record.structuredContent &&
+      typeof (record.structuredContent as Record<string, unknown>).content === "string"
+    ) {
+      return (record.structuredContent as Record<string, unknown>).content as string;
+    }
+  }
+  try {
+    return JSON.stringify(result, null, 2);
+  } catch {
+    return String(result);
+  }
+}
+
+async function runCodex(thread: CodexThread, prompt: string): Promise<string> {
+  const result = await thread.run(prompt);
+  return coerceCodexText(result);
+}
+
+type FixResponse = {
+  applied?: boolean;
+  summary?: string;
+  filesTouched?: string[];
+  reason?: string;
+};
+
+function parseFixResponse(response: string): FixResponse | null {
+  const jsonMatch = response.match(/```json\n?([\s\S]*?)\n?```/);
+  const candidate = jsonMatch?.[1] || response;
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    const objectMatch = response.match(/\{[\s\S]*\}/);
+    if (objectMatch) {
+      try {
+        return JSON.parse(objectMatch[0]);
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+}
 
 /**
  * Main triage agent orchestrator
@@ -22,9 +95,32 @@ export async function runTriageAgent(
   console.log(`   Failure Class: ${context.failureClass}`);
   console.log(`   Routing: ${context.routingDecision}`);
 
+  const needsAgent =
+    context.routingDecision !== "flake_workflow" && context.routingDecision !== "escalate";
+  const thread = needsAgent ? await startCodexThread() : null;
+  const threadId = thread ? getThreadId(thread) : undefined;
+  if (threadId) {
+    console.log(`   Codex thread: ${threadId}`);
+  }
+
+  if (thread) {
+    try {
+      const plan = await runCodex(thread, buildPrompt(PROMPTS.plan(context)));
+      if (plan.trim()) {
+        console.log("\n🧭 Agent plan:");
+        console.log(plan.trim());
+      }
+    } catch (error) {
+      console.log(`   ⚠️  Plan step skipped: ${error}`);
+    }
+  }
+
   // Check routing decision
   if (context.routingDecision === "report_only") {
-    return await generateReportOnly(context);
+    if (!thread) {
+      return await generateReportOnly(await startCodexThread(), context);
+    }
+    return await generateReportOnly(thread, context);
   }
 
   if (context.routingDecision === "flake_workflow") {
@@ -50,7 +146,10 @@ export async function runTriageAgent(
     // ─────────────────────────────────────────────────────────────
     console.log("\n🔍 Phase 1: Diagnosing failure...");
 
-    const diagnosis = await runDiagnosis(context);
+    if (!thread) {
+      throw new Error("Codex thread unavailable for diagnosis");
+    }
+    const diagnosis = await runDiagnosis(thread, context);
     console.log(`   Root Cause: ${diagnosis.rootCause.slice(0, 100)}...`);
     console.log(`   Can Fix: ${diagnosis.canFix}`);
     console.log(`   Confidence: ${diagnosis.confidence}`);
@@ -79,10 +178,22 @@ export async function runTriageAgent(
       console.log("   ⚠️  No allowed files identified; file updates will be blocked for safety.");
     }
 
-    await generateFix(diagnosis, config.guardrails, allowedFiles);
+    const fixResponse = await generateFix(thread, diagnosis, config.guardrails, allowedFiles);
 
     // Get and validate the diff
     let patchDiff = getCurrentDiff();
+    if (!patchDiff.trim()) {
+      const reason = fixResponse?.reason || "No file changes were applied";
+      return {
+        success: false,
+        rootCause: diagnosis.rootCause,
+        fixSummary: `Fix aborted: ${reason}`,
+        patchDiff: "",
+        verificationLog: "",
+        confidence: "low",
+        routingDecision: context.routingDecision
+      };
+    }
     const validation = validatePatch(
       patchDiff,
       config.guardrails.max_diff_lines,
@@ -151,7 +262,7 @@ export async function runTriageAgent(
       console.log("   ⚠️  Verification failed, attempting retry...");
 
       for (let attempt = 1; attempt <= config.behavior.max_retries; attempt++) {
-        await retryFix(verificationResult.output, attempt, allowedFiles);
+        await retryFix(thread, verificationResult.output, attempt, allowedFiles);
         patchDiff = getCurrentDiff();
 
         const retryValidation = validatePatch(
@@ -206,7 +317,8 @@ export async function runTriageAgent(
     // ─────────────────────────────────────────────────────────────
     console.log("\n📋 Phase 4: Generating RCA...");
 
-    const rca = await generateRCA(diagnosis, patchDiff, verificationResult, context);
+    const fixSummary = fixResponse?.summary || diagnosis.suggestedFix || "Minimal patch";
+    const rca = await generateRCA(diagnosis, patchDiff, verificationResult, context, fixSummary, thread);
 
     return {
       success: true,
@@ -238,125 +350,52 @@ export async function runTriageAgent(
 }
 
 /**
- * Run diagnosis phase using OpenAI
+ * Run diagnosis phase using Codex
  */
-async function runDiagnosis(context: FailureContext): Promise<Diagnosis> {
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o",
-    messages: [
-      { role: "system", content: PROMPTS.system },
-      { role: "user", content: PROMPTS.diagnosis(context) }
-    ],
-    temperature: 0.2,
-    max_tokens: 2000
-  });
-
-  const content = response.choices[0]?.message?.content || "";
+async function runDiagnosis(thread: CodexThread, context: FailureContext): Promise<Diagnosis> {
+  const content = await runCodex(thread, buildPrompt(PROMPTS.diagnosis(context)));
   return parseDiagnosis(content);
 }
 
 /**
- * Generate fix using OpenAI with tool use for file editing
+ * Generate fix using Codex for file editing
  */
 async function generateFix(
+  thread: CodexThread,
   diagnosis: Diagnosis,
   guardrails: GreenlitConfig["guardrails"],
   allowedFiles: string[]
-): Promise<void> {
-  // Read the affected files first
-  const fileContents: Record<string, string> = {};
-  for (const file of diagnosis.affectedFiles) {
-    if (!isAllowedFilePath(file, allowedFiles)) {
-      console.log(`   Skipping unsafe or disallowed file read: ${file}`);
-      continue;
-    }
-    try {
-      const content = fs.readFileSync(file, "utf-8");
-      fileContents[file] = content;
-    } catch {
-      console.log(`   Warning: Could not read ${file}`);
-    }
+): Promise<FixResponse | null> {
+  const content = await runCodex(
+    thread,
+    buildPrompt(PROMPTS.generateFix(diagnosis, guardrails, allowedFiles))
+  );
+  const parsed = parseFixResponse(content);
+  if (parsed?.summary) {
+    console.log(`   Fix summary: ${parsed.summary}`);
   }
-
-  const filesContext = Object.entries(fileContents)
-    .map(([path, content]) => `### ${path}\n\`\`\`\n${content}\n\`\`\``)
-    .join("\n\n");
-
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o",
-    messages: [
-      { role: "system", content: PROMPTS.system },
-      {
-        role: "user",
-        content: `${PROMPTS.generateFix(diagnosis, guardrails)}\n\n## Current File Contents\n${filesContext}\n\nProvide the COMPLETE fixed file contents for each file that needs changes. Format as:\n\n### path/to/file.ts\n\`\`\`typescript\n// complete file content\n\`\`\``
-      }
-    ],
-    temperature: 0.2,
-    max_tokens: 4000
-  });
-
-  const content = response.choices[0]?.message?.content || "";
-
-  // Parse and write the fixed files
-  const filePattern = /###\s*([^\n]+)\n```[\w]*\n([\s\S]*?)```/g;
-  let match;
-
-  while ((match = filePattern.exec(content)) !== null) {
-    const filePath = match[1].trim();
-    const fileContent = match[2];
-
-    if (!isAllowedFilePath(filePath, allowedFiles)) {
-      console.log(`   Skipping unsafe or disallowed file update: ${filePath}`);
-      continue;
-    }
-
-    try {
-      fs.writeFileSync(filePath, fileContent);
-      console.log(`   Updated: ${filePath}`);
-    } catch (err) {
-      console.log(`   Failed to write ${filePath}: ${err}`);
-    }
+  if (parsed?.applied === false) {
+    console.log(`   ⚠️  Fix not applied: ${parsed.reason || "unspecified"}`);
   }
+  return parsed;
 }
 
 /**
  * Retry fix after verification failure
  */
 async function retryFix(
+  thread: CodexThread,
   failureOutput: string,
   attempt: number,
   allowedFiles: string[]
 ): Promise<void> {
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o",
-    messages: [
-      { role: "system", content: PROMPTS.system },
-      { role: "user", content: PROMPTS.retryFix(failureOutput, attempt) }
-    ],
-    temperature: 0.3,
-    max_tokens: 3000
-  });
-
-  const content = response.choices[0]?.message?.content || "";
-
-  // Parse and apply any file updates
-  const filePattern = /###\s*([^\n]+)\n```[\w]*\n([\s\S]*?)```/g;
-  let match;
-
-  while ((match = filePattern.exec(content)) !== null) {
-    const filePath = match[1].trim();
-    const fileContent = match[2];
-
-    try {
-      if (!isAllowedFilePath(filePath, allowedFiles)) {
-        console.log(`   Skipping unsafe or disallowed retry update: ${filePath}`);
-        continue;
-      }
-      fs.writeFileSync(filePath, fileContent);
-      console.log(`   Retry updated: ${filePath}`);
-    } catch (err) {
-      console.log(`   Retry failed to write ${filePath}: ${err}`);
-    }
+  const content = await runCodex(
+    thread,
+    buildPrompt(PROMPTS.retryFix(failureOutput, attempt, allowedFiles))
+  );
+  const parsed = parseFixResponse(content);
+  if (parsed?.summary) {
+    console.log(`   Retry summary: ${parsed.summary}`);
   }
 }
 
@@ -379,13 +418,6 @@ function isSafeRelativePath(filePath: string): boolean {
   if (path.isAbsolute(filePath)) return false;
   const parts = filePath.split("/");
   return !parts.some(part => part === "..");
-}
-
-function isAllowedFilePath(filePath: string, allowedFiles: string[]): boolean {
-  if (!allowedFiles.length) return false;
-  const normalized = normalizeFilePath(filePath);
-  if (!isSafeRelativePath(normalized)) return false;
-  return allowedFiles.includes(normalized);
 }
 
 function extractDiffFiles(diff: string): {
@@ -457,22 +489,16 @@ async function generateRCA(
   diagnosis: Diagnosis,
   patchDiff: string,
   verification: VerificationResult,
-  context: FailureContext
+  context: FailureContext,
+  fixSummary: string,
+  thread: CodexThread
 ): Promise<string> {
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o",
-    messages: [
-      { role: "system", content: PROMPTS.system },
-      { role: "user", content: PROMPTS.generateRCA(diagnosis, patchDiff, verification, context) }
-    ],
-    temperature: 0.2,
-    max_tokens: 1500
-  });
+  const content = await runCodex(
+    thread,
+    buildPrompt(PROMPTS.generateRCA(diagnosis, patchDiff, verification, context, fixSummary))
+  );
 
-  const candidate =
-    response.choices[0]?.message?.content?.trim() ||
-    diagnosis.suggestedFix ||
-    "Fix applied";
+  const candidate = content.trim() || diagnosis.suggestedFix || "Fix applied";
 
   if (isValidRca(candidate)) {
     return candidate;
@@ -527,20 +553,10 @@ ${fixSummary}
 /**
  * Generate report for non-fixable failures
  */
-async function generateReportOnly(context: FailureContext): Promise<TriageResult> {
+async function generateReportOnly(thread: CodexThread, context: FailureContext): Promise<TriageResult> {
   console.log("\n📋 Generating report-only (no fix attempt)...");
 
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o",
-    messages: [
-      { role: "system", content: PROMPTS.system },
-      { role: "user", content: PROMPTS.reportOnly(context) }
-    ],
-    temperature: 0.2,
-    max_tokens: 1500
-  });
-
-  const report = response.choices[0]?.message?.content || "";
+  const report = await runCodex(thread, buildPrompt(PROMPTS.reportOnly(context)));
 
   return {
     success: false,

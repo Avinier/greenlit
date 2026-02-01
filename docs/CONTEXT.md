@@ -160,8 +160,11 @@ Planned Additions (Pivot)
 ---
 10. PROMPTS & AI INTEGRATION
 
-Current prompts focus on diagnosis + patch generation.
-Pivot requires:
+Agentic flow uses the Codex SDK (TypeScript) with a single thread per triage:
+- Plan → Diagnose → (Optional) Fix → Verify → RCA
+- File edits are performed by Codex when allowed; guardrails still enforce diff limits
+
+Prompt needs still include:
 - Failure Card summarization prompt
 - Owner routing explanation template
 - Report-only guidance template

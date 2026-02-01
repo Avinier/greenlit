@@ -17,20 +17,39 @@ export const PROMPTS = {
   /**
    * System prompt that defines the agent's role and constraints
    */
-  system: `You are Greenlit, a CI failure triage agent. Your job is to:
+  system: `You are Greenlit, a CI incident response agent. Your job is to:
 1. Diagnose why CI failed
-2. Generate minimal fixes that make CI pass
-3. Verify fixes by re-running the failing commands
+2. Produce an incident packet (Failure Card + guidance)
+3. Only apply code changes when explicitly asked
 
-CONSTRAINTS:
-- Make MINIMAL changes - only fix what's broken
+SAFETY CONSTRAINTS:
+- Prefer report-only guidance unless asked to fix
+- Make MINIMAL, surgical edits only
+- Only touch explicitly allowed files
 - Do NOT refactor, improve, or add features
-- Do NOT modify package-lock.json, yarn.lock, or .env files
-- Keep patches under 200 lines changed
-- Focus on making the failing check pass, nothing more
+- Do NOT modify lockfiles or secrets
+- You may read files as needed, but do NOT run tests, builds, network calls, or git commands unless explicitly asked
 
 OUTPUT FORMAT:
-Always respond with structured JSON when asked for diagnosis or RCA.
+- When asked for JSON, respond with JSON only (no prose)
+- When asked for markdown, follow the template exactly
+`,
+
+  /**
+   * Agentic plan prompt - lightweight plan before action
+   */
+  plan: (context: FailureContext) => `
+Create a short action plan for this CI incident response. Keep it to 3-6 numbered steps.
+Do NOT run commands or edit files. This is planning only.
+
+## Failure Context
+- **Repository**: ${context.repo}
+- **Branch**: ${context.branch}
+- **Commit**: ${context.sha}
+- **Workflow**: ${context.workflowName}
+- **Failure Type**: ${context.failureType}
+- **Failure Class**: ${context.failureClass}
+- **Routing**: ${context.routingDecision}
 `,
 
   /**
@@ -99,8 +118,9 @@ Respond with JSON:
   /**
    * Generate fix prompt - apply minimal changes
    */
-  generateFix: (diagnosis: Diagnosis, guardrails: Guardrails) => `
-Generate a MINIMAL fix for the root cause you identified.
+  generateFix: (diagnosis: Diagnosis, guardrails: Guardrails, allowedFiles: string[]) => `
+Apply a MINIMAL fix for the root cause you identified.
+You MAY edit files directly to implement the fix.
 
 ## Root Cause
 ${diagnosis.rootCause}
@@ -110,11 +130,12 @@ ${diagnosis.suggestedFix || "Apply minimal changes to fix the failing check"}
 
 ## Files to Modify
 ${diagnosis.affectedFiles.map(f => `- ${f}`).join("\n")}
+${allowedFiles.length ? `\n## Allowed Files (strict)\n${allowedFiles.map(f => `- ${f}`).join("\n")}` : ""}
 
 ## CONSTRAINTS (MUST follow)
 - Maximum ${guardrails.max_diff_lines} lines changed
 - Do NOT modify: ${guardrails.forbidden_patterns.join(", ")}
-- Only edit the files listed above
+- Only edit files that appear in the Allowed Files list (strict)
 - Keep the fix as small as possible - surgical precision
 - Do NOT add extra features, refactoring, or improvements
 - Do NOT add comments explaining your fix
@@ -125,13 +146,28 @@ ${diagnosis.affectedFiles.map(f => `- ${f}`).join("\n")}
 2. Make the minimal code changes to fix the issue
 3. Focus ONLY on making the failing check pass
 
-After making changes, summarize what you modified in one sentence.
+After making changes, respond with JSON:
+\`\`\`json
+{
+  "applied": true,
+  "summary": "One sentence summary of the change",
+  "filesTouched": ["path/to/file.ts"]
+}
+\`\`\`
+
+If you cannot safely fix it, respond with JSON:
+\`\`\`json
+{
+  "applied": false,
+  "reason": "Why a safe fix cannot be applied"
+}
+\`\`\`
 `,
 
   /**
    * Retry fix prompt - when first fix doesn't work
    */
-  retryFix: (failureOutput: string, attempt: number) => `
+  retryFix: (failureOutput: string, attempt: number, allowedFiles: string[]) => `
 The previous fix did not pass verification (attempt ${attempt}).
 
 ## Verification Output
@@ -150,6 +186,11 @@ Do NOT:
 - Make changes unrelated to the failure
 
 Focus on fixing the specific issue shown in the verification output.
+
+Only touch these files:
+${allowedFiles.length ? allowedFiles.map(f => `- ${f}`).join("\n") : "- (none allowed)"}
+
+After making changes, respond with JSON using the same schema as before.
 `,
 
   /**
@@ -159,14 +200,15 @@ Focus on fixing the specific issue shown in the verification output.
     diagnosis: Diagnosis,
     patchDiff: string,
     verification: VerificationResult,
-    context: FailureContext
+    context: FailureContext,
+    fixSummary?: string
   ) => `
 Generate a concise Root Cause Analysis report in markdown format.
 
 ## Context
 - Failure Type: ${context.failureType}
 - Root Cause: ${diagnosis.rootCause}
-- Fix Applied: ${diagnosis.suggestedFix || "Minimal patch"}
+- Fix Applied: ${fixSummary || diagnosis.suggestedFix || "Minimal patch"}
 - Verification: ${verification.passed ? "PASSED" : "FAILED"}
 
 ## Patch Applied
