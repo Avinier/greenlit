@@ -148,3 +148,14 @@ export function getSignatureMemory(record?: SignatureRecord): MemorySummary {
     threadUrl: record.threadUrl
   };
 }
+
+export function setSignatureThread(
+  signature: string,
+  ledger: SignatureLedger,
+  threadUrl: string
+): void {
+  const record = ledger.records[signature];
+  if (!record) return;
+  record.threadUrl = threadUrl;
+  record.lastSeen = new Date().toISOString();
+}

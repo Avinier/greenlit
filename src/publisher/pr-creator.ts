@@ -58,7 +58,7 @@ export async function postComment(
   context: FailureContext,
   result: TriageResult,
   prDetails?: PRDetails
-): Promise<void> {
+): Promise<string | undefined> {
   const body = formatCommentBody(result, context, prDetails);
 
   // Try to find associated PR
@@ -70,22 +70,24 @@ export async function postComment(
 
   if (prs.length > 0) {
     // Post on the PR
-    await octokit.rest.issues.createComment({
+    const { data } = await octokit.rest.issues.createComment({
       owner,
       repo,
       issue_number: prs[0].number,
       body
     });
     console.log(`   Comment posted on PR #${prs[0].number}`);
+    return data.html_url;
   } else {
     // Post on the commit
-    await octokit.rest.repos.createCommitComment({
+    const { data } = await octokit.rest.repos.createCommitComment({
       owner,
       repo,
       commit_sha: context.sha,
       body
     });
     console.log(`   Comment posted on commit ${context.sha.substring(0, 7)}`);
+    return data.html_url;
   }
 }
 
