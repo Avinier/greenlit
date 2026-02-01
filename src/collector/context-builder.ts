@@ -8,6 +8,7 @@ import type {
   RoutingDecision,
   FailedJob
 } from "./types.js";
+import { buildEvidencePack } from "./evidence.js";
 
 /**
  * Build comprehensive failure context from workflow run data
@@ -59,6 +60,7 @@ export async function buildFailureContext(
     relevantFiles,
     rawLogs: combinedLogs,
     extractedErrors: extractErrorMessages(combinedLogs),
+    evidence: buildEvidencePack(combinedLogs, failedJobs),
     changedFiles,
     recentCommits,
     fingerprint

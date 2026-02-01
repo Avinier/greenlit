@@ -139,6 +139,17 @@ ${result.rootCause}
 
 ---
 
+## 🧾 Evidence
+
+${context.evidence?.file ? `- **File**: \`${context.evidence.file}\`` : "- **File**: (not detected)"}
+${context.evidence?.line ? `\n- **Line**: \`${context.evidence.line}\`` : "\n- **Line**: (not detected)"}
+${context.evidence?.job ? `\n- **Job**: ${context.evidence.job}` : "\n- **Job**: (not detected)"}
+${context.evidence?.step ? `\n- **Step**: ${context.evidence.step}` : "\n- **Step**: (not detected)"}
+
+${context.evidence?.excerpt ? `\n\n\`\`\`\n${context.evidence.excerpt}\n\`\`\`` : ""}
+
+---
+
 ## 🔧 Fix Applied
 
 ${result.fixSummary}
@@ -271,6 +282,17 @@ ${context.errorSignature}
 ## Root Cause
 
 ${result.rootCause}
+
+---
+
+## Evidence
+
+${context.evidence?.file ? `- **File**: \`${context.evidence.file}\`` : "- **File**: (not detected)"}
+${context.evidence?.line ? `\n- **Line**: \`${context.evidence.line}\`` : "\n- **Line**: (not detected)"}
+${context.evidence?.job ? `\n- **Job**: ${context.evidence.job}` : "\n- **Job**: (not detected)"}
+${context.evidence?.step ? `\n- **Step**: ${context.evidence.step}` : "\n- **Step**: (not detected)"}
+
+${context.evidence?.excerpt ? `\n\n\`\`\`\n${context.evidence.excerpt}\n\`\`\`` : ""}
 
 ---
 

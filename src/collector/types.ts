@@ -69,6 +69,15 @@ export interface FailureContext {
   rawLogs: string;
   extractedErrors: string[];
 
+  // Evidence pack
+  evidence?: {
+    file?: string;
+    line?: string;
+    excerpt?: string;
+    job?: string;
+    step?: string;
+  };
+
   // Git context
   changedFiles: string[];
   recentCommits: string[];

@@ -7,6 +7,14 @@ import * as fs from "fs";
 import { collectFailureContext } from "./collector/github-logs.js";
 import { buildFailureContext } from "./collector/context-builder.js";
 import { runTriageAgent } from "./agent/orchestrator.js";
+import { routeFailure } from "./agent/routing.js";
+import {
+  computeSignature,
+  loadSignatureLedger,
+  saveSignatureLedger,
+  shouldAttemptSignature,
+  updateSignatureLedger
+} from "./agent/signatures.js";
 import { createFixBranch, commitChanges, pushBranch, getCurrentBranch, cleanupBranch } from "./publisher/branch-manager.js";
 import { createPullRequest, postComment, formatRCAMarkdown } from "./publisher/pr-creator.js";
 import { loadConfig } from "./config/greenlit.config.js";
@@ -72,11 +80,53 @@ program
       }
 
       const context = await buildFailureContext(runContext);
+      context.routingDecision = routeFailure(context, config);
+      const signature = computeSignature(context);
 
       console.log(chalk.gray(`   Failure Type: ${context.failureType}`));
       console.log(chalk.gray(`   Failure Class: ${context.failureClass}`));
       console.log(chalk.gray(`   Routing: ${context.routingDecision}`));
       console.log(chalk.gray(`   Error: ${context.errorSignature.slice(0, 80)}...`));
+
+      const ledger = loadSignatureLedger(config.signature_ledger.path);
+      const signatureCheck = shouldAttemptSignature(signature, ledger, config);
+      if (!signatureCheck.allowed) {
+        console.log(chalk.yellow(`⚠️  Skipping fix attempt: ${signatureCheck.reason}`));
+        updateSignatureLedger(signature, ledger, "report-only");
+        saveSignatureLedger(config.signature_ledger.path, ledger);
+
+        const result = {
+          success: false,
+          rootCause: context.errorSignature,
+          fixSummary: signatureCheck.reason || "Signature attempt blocked",
+          patchDiff: "",
+          verificationLog: "",
+          confidence: "medium",
+          routingDecision: "report_only" as const
+        };
+
+        const output = {
+          success: result.success,
+          signature,
+          context: {
+            runId: context.runId,
+            repo: context.repo,
+            branch: context.branch,
+            sha: context.sha,
+            failureType: context.failureType,
+            failureClass: context.failureClass,
+            fingerprint: context.fingerprint,
+            evidence: context.evidence
+          },
+          result,
+          timestamp: new Date().toISOString()
+        };
+
+        fs.writeFileSync(options.output, JSON.stringify(output, null, 2));
+        const rcaPath = options.output.replace(".json", "-rca.md");
+        fs.writeFileSync(rcaPath, formatRCAMarkdown(result, context));
+        process.exit(1);
+      }
 
       // ─────────────────────────────────────────────────────────────
       // Step 2: Run triage agent
@@ -84,12 +134,23 @@ program
       console.log(chalk.blue("\n🤖 Running triage agent..."));
 
       const result = await runTriageAgent(context, config);
+      const outcome =
+        result.routingDecision === "report_only"
+          ? "report-only"
+          : result.routingDecision === "flake_workflow"
+          ? "quarantine"
+          : result.success
+          ? "fix"
+          : "failed";
+      updateSignatureLedger(signature, ledger, outcome);
+      saveSignatureLedger(config.signature_ledger.path, ledger);
 
       // ─────────────────────────────────────────────────────────────
       // Step 3: Write result
       // ─────────────────────────────────────────────────────────────
       const output = {
         success: result.success,
+        signature,
         context: {
           runId: context.runId,
           repo: context.repo,
@@ -97,7 +158,8 @@ program
           sha: context.sha,
           failureType: context.failureType,
           failureClass: context.failureClass,
-          fingerprint: context.fingerprint
+          fingerprint: context.fingerprint,
+          evidence: context.evidence
         },
         result: {
           rootCause: result.rootCause,
@@ -175,7 +237,8 @@ program
         failedCommand: "",
         errorSignature: result.rootCause.split("\n")[0],
         relevantFiles: [],
-        workflowName: "CI"
+        workflowName: "CI",
+        evidence: data.context?.evidence
       };
 
       if (!result.success) {

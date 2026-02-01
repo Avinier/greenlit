@@ -50,6 +50,12 @@ routing:
   # Route to flake workflow
   flake_workflow:
     - flaky
+  max_attempts_per_signature: 2
+
+# Signature ledger
+signature_ledger:
+  path: "data/signatures.json"
+  ttl_days: 30
 
 # Output
 output:

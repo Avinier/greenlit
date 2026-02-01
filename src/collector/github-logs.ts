@@ -1,4 +1,5 @@
 import { Octokit } from "@octokit/rest";
+import AdmZip from "adm-zip";
 import type { WorkflowRunContext, FailedJob, FailedStep } from "./types.js";
 
 /**
@@ -72,10 +73,38 @@ async function fetchJobLogs(
       repo,
       job_id: jobId
     });
-    return data as unknown as string;
+    const buffer = normalizeLogBuffer(data);
+    return unzipAndConcatLogs(buffer);
   } catch (error) {
     console.warn(`Failed to fetch logs for job ${jobId}:`, error);
     return "";
+  }
+}
+
+function normalizeLogBuffer(data: unknown): Buffer {
+  if (Buffer.isBuffer(data)) return data;
+  if (data instanceof ArrayBuffer) return Buffer.from(new Uint8Array(data));
+  if (typeof data === "string") return Buffer.from(data, "utf-8");
+  return Buffer.from("");
+}
+
+function unzipAndConcatLogs(buffer: Buffer): string {
+  if (!buffer.length) return "";
+  const isZip = buffer[0] === 0x50 && buffer[1] === 0x4b;
+  if (!isZip) {
+    return buffer.toString("utf-8");
+  }
+
+  try {
+    const zip = new AdmZip(buffer);
+    const entries = zip.getEntries().filter(e => !e.isDirectory);
+    return entries
+      .sort((a, b) => a.entryName.localeCompare(b.entryName))
+      .map(entry => entry.getData().toString("utf-8"))
+      .join("\n");
+  } catch (error) {
+    console.warn("Failed to unzip logs:", error);
+    return buffer.toString("utf-8");
   }
 }
 
