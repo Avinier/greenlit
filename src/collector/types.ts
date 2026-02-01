@@ -25,6 +25,14 @@ export interface FailedStep {
   completedAt: string;
 }
 
+export interface EvidencePack {
+  file?: string;
+  line?: string;
+  excerpt?: string;
+  job?: string;
+  step?: string;
+}
+
 export type FailureType =
   | "test"
   | "lint"
@@ -46,6 +54,50 @@ export type RoutingDecision =
   | "report_only"       // Just report, no code changes
   | "flake_workflow"    // Quarantine + ticket
   | "escalate";         // Ask for human input
+
+export type OwnerAssignmentSource =
+  | "codeowners"
+  | "blame"
+  | "team_map"
+  | "last_commit"
+  | "fallback"
+  | "unknown";
+
+export interface OwnerAssignment {
+  owner: string;
+  source: OwnerAssignmentSource;
+  reason: string;
+  confidence: "high" | "medium" | "low";
+  candidates?: string[];
+  file?: string;
+  line?: string;
+}
+
+export interface MemorySummary {
+  seenBefore: boolean;
+  lastSeen?: string;
+  lastOutcome?: string;
+  lastOwner?: string;
+  lastResolution?: string;
+  threadUrl?: string;
+}
+
+export interface FailureCard {
+  title: string;
+  summary: string;
+  workflowName: string;
+  job?: string;
+  step?: string;
+  failedCommand?: string;
+  errorSignature: string;
+  evidence?: EvidencePack;
+  failureType: FailureType;
+  failureClass: FailureClass;
+  routingDecision: RoutingDecision;
+  owner?: OwnerAssignment;
+  memory?: MemorySummary;
+  action: string;
+}
 
 export interface FailureContext {
   // Metadata
@@ -70,13 +122,7 @@ export interface FailureContext {
   extractedErrors: string[];
 
   // Evidence pack
-  evidence?: {
-    file?: string;
-    line?: string;
-    excerpt?: string;
-    job?: string;
-    step?: string;
-  };
+  evidence?: EvidencePack;
 
   // Git context
   changedFiles: string[];
@@ -94,6 +140,9 @@ export interface TriageResult {
   verificationLog: string;
   confidence: "high" | "medium" | "low";
   routingDecision: RoutingDecision;
+  ownerAssignment?: OwnerAssignment;
+  memory?: MemorySummary;
+  failureCard?: FailureCard;
   candidateFixes?: Array<{ description: string; confidence: number }>;
 }
 

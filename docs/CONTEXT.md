@@ -188,7 +188,7 @@ Trust Through Restraint
 ---
 FILE MANIFEST
 
-Source Files (13 total):
+Source Files (15 total):
 1. /src/index.ts - CLI entry point
 2. /src/collector/github-logs.ts - Fetch GitHub Actions logs
 3. /src/collector/context-builder.ts - Build failure context
@@ -198,10 +198,12 @@ Source Files (13 total):
 7. /src/agent/prompts.ts - OpenAI prompts
 8. /src/agent/routing.ts - Route failures
 9. /src/agent/signatures.ts - Signature ledger
-10. /src/agent/verifier.ts - Fix verification
-11. /src/publisher/pr-creator.ts - Publish comments / PRs
-12. /src/publisher/branch-manager.ts - Git operations
-13. /src/config/greenlit.config.ts - Config management
+10. /src/agent/owner-routing.ts - Owner assignment logic
+11. /src/agent/failure-card.ts - Failure Card builder
+12. /src/agent/verifier.ts - Fix verification
+13. /src/publisher/pr-creator.ts - Publish comments / PRs
+14. /src/publisher/branch-manager.ts - Git operations
+15. /src/config/greenlit.config.ts - Config management
 
 Config & Workflows:
 - /greenlit.yml - User configuration

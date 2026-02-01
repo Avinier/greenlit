@@ -1,7 +1,7 @@
 import { createHash } from "crypto";
 import fs from "fs";
 import path from "path";
-import type { FailureContext } from "../collector/types.js";
+import type { FailureContext, MemorySummary } from "../collector/types.js";
 import type { GreenlitConfig } from "../config/greenlit.config.js";
 
 export type SignatureOutcome = "fix" | "report-only" | "quarantine" | "failed";
@@ -11,6 +11,9 @@ export interface SignatureRecord {
   attempts: number;
   lastSeen: string;
   lastOutcome: SignatureOutcome;
+  lastOwner?: string;
+  lastResolution?: string;
+  threadUrl?: string;
 }
 
 export interface SignatureLedger {
@@ -104,7 +107,8 @@ export function shouldAttemptSignature(
 export function updateSignatureLedger(
   signature: string,
   ledger: SignatureLedger,
-  outcome: SignatureOutcome
+  outcome: SignatureOutcome,
+  details?: { owner?: string; resolution?: string; threadUrl?: string }
 ): void {
   const now = new Date().toISOString();
   const record = ledger.records[signature] || {
@@ -117,6 +121,30 @@ export function updateSignatureLedger(
   record.attempts += 1;
   record.lastSeen = now;
   record.lastOutcome = outcome;
+  if (details?.owner) {
+    record.lastOwner = details.owner;
+  }
+  if (details?.resolution) {
+    record.lastResolution = details.resolution;
+  }
+  if (details?.threadUrl) {
+    record.threadUrl = details.threadUrl;
+  }
 
   ledger.records[signature] = record;
+}
+
+export function getSignatureMemory(record?: SignatureRecord): MemorySummary {
+  if (!record) {
+    return { seenBefore: false };
+  }
+
+  return {
+    seenBefore: true,
+    lastSeen: record.lastSeen,
+    lastOutcome: record.lastOutcome,
+    lastOwner: record.lastOwner,
+    lastResolution: record.lastResolution,
+    threadUrl: record.threadUrl
+  };
 }

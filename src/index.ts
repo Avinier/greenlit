@@ -11,10 +11,13 @@ import { routeFailure } from "./agent/routing.js";
 import {
   computeSignature,
   loadSignatureLedger,
+  getSignatureMemory,
   saveSignatureLedger,
   shouldAttemptSignature,
   updateSignatureLedger
 } from "./agent/signatures.js";
+import { resolveOwnerAssignment } from "./agent/owner-routing.js";
+import { buildFailureCard } from "./agent/failure-card.js";
 import { createFixBranch, commitChanges, pushBranch, getCurrentBranch, cleanupBranch } from "./publisher/branch-manager.js";
 import { createPullRequest, postComment, formatRCAMarkdown } from "./publisher/pr-creator.js";
 import { loadConfig } from "./config/greenlit.config.js";
@@ -24,7 +27,7 @@ const program = new Command();
 
 program
   .name("greenlit")
-  .description("🤖 Automated CI failure triage and fix agent")
+  .description("🤖 CI incident response agent for failed workflows")
   .version("0.1.0");
 
 // ─────────────────────────────────────────────────────────────
@@ -32,7 +35,7 @@ program
 // ─────────────────────────────────────────────────────────────
 program
   .command("triage")
-  .description("Analyze a CI failure and attempt to fix it")
+  .description("Analyze a CI failure and produce an incident card")
   .requiredOption("--run-id <id>", "GitHub Actions run ID")
   .requiredOption("--repo <owner/repo>", "Repository in owner/repo format")
   .requiredOption("--branch <branch>", "Branch name")
@@ -82,6 +85,7 @@ program
       const context = await buildFailureContext(runContext);
       context.routingDecision = routeFailure(context, config);
       const signature = computeSignature(context);
+      const ownerAssignment = resolveOwnerAssignment(context, config);
 
       console.log(chalk.gray(`   Failure Type: ${context.failureType}`));
       console.log(chalk.gray(`   Failure Class: ${context.failureClass}`));
@@ -90,20 +94,27 @@ program
 
       const ledger = loadSignatureLedger(config.signature_ledger.path);
       const signatureCheck = shouldAttemptSignature(signature, ledger, config);
+      const memory = getSignatureMemory(signatureCheck.record);
       if (!signatureCheck.allowed) {
         console.log(chalk.yellow(`⚠️  Skipping fix attempt: ${signatureCheck.reason}`));
-        updateSignatureLedger(signature, ledger, "report-only");
+        updateSignatureLedger(signature, ledger, "report-only", {
+          owner: ownerAssignment.owner,
+          resolution: signatureCheck.reason || "Signature attempt blocked"
+        });
         saveSignatureLedger(config.signature_ledger.path, ledger);
 
-        const result = {
+        const result: TriageResult = {
           success: false,
           rootCause: context.errorSignature,
           fixSummary: signatureCheck.reason || "Signature attempt blocked",
           patchDiff: "",
           verificationLog: "",
           confidence: "medium",
-          routingDecision: "report_only" as const
+          routingDecision: "report_only" as const,
+          ownerAssignment,
+          memory
         };
+        result.failureCard = buildFailureCard(context, result, ownerAssignment, memory);
 
         const output = {
           success: result.success,
@@ -113,8 +124,13 @@ program
             repo: context.repo,
             branch: context.branch,
             sha: context.sha,
+            workflowName: context.workflowName,
             failureType: context.failureType,
             failureClass: context.failureClass,
+            routingDecision: context.routingDecision,
+            failedCommand: context.failedCommand,
+            errorSignature: context.errorSignature,
+            relevantFiles: context.relevantFiles,
             fingerprint: context.fingerprint,
             evidence: context.evidence
           },
@@ -134,6 +150,9 @@ program
       console.log(chalk.blue("\n🤖 Running triage agent..."));
 
       const result = await runTriageAgent(context, config);
+      result.ownerAssignment = ownerAssignment;
+      result.memory = memory;
+      result.failureCard = buildFailureCard(context, result, ownerAssignment, memory);
       const outcome =
         result.routingDecision === "report_only"
           ? "report-only"
@@ -142,7 +161,10 @@ program
           : result.success
           ? "fix"
           : "failed";
-      updateSignatureLedger(signature, ledger, outcome);
+      updateSignatureLedger(signature, ledger, outcome, {
+        owner: ownerAssignment.owner,
+        resolution: result.fixSummary
+      });
       saveSignatureLedger(config.signature_ledger.path, ledger);
 
       // ─────────────────────────────────────────────────────────────
@@ -151,26 +173,34 @@ program
       const output = {
         success: result.success,
         signature,
-        context: {
-          runId: context.runId,
-          repo: context.repo,
-          branch: context.branch,
-          sha: context.sha,
-          failureType: context.failureType,
-          failureClass: context.failureClass,
-          fingerprint: context.fingerprint,
-          evidence: context.evidence
-        },
-        result: {
-          rootCause: result.rootCause,
-          fixSummary: result.fixSummary,
-          confidence: result.confidence,
-          routingDecision: result.routingDecision,
-          patchDiff: result.patchDiff,
-          verificationLog: result.verificationLog
-        },
-        timestamp: new Date().toISOString()
-      };
+          context: {
+            runId: context.runId,
+            repo: context.repo,
+            branch: context.branch,
+            sha: context.sha,
+            workflowName: context.workflowName,
+            failureType: context.failureType,
+            failureClass: context.failureClass,
+            routingDecision: context.routingDecision,
+            failedCommand: context.failedCommand,
+            errorSignature: context.errorSignature,
+            relevantFiles: context.relevantFiles,
+            fingerprint: context.fingerprint,
+            evidence: context.evidence
+          },
+          result: {
+            rootCause: result.rootCause,
+            fixSummary: result.fixSummary,
+            confidence: result.confidence,
+            routingDecision: result.routingDecision,
+            patchDiff: result.patchDiff,
+            verificationLog: result.verificationLog,
+            ownerAssignment: result.ownerAssignment,
+            memory: result.memory,
+            failureCard: result.failureCard
+          },
+          timestamp: new Date().toISOString()
+        };
 
       fs.writeFileSync(options.output, JSON.stringify(output, null, 2));
       console.log(chalk.gray(`\n📄 Result written to ${options.output}`));
@@ -190,8 +220,8 @@ program
           console.log(chalk.gray("   Run 'greenlit publish' to create PR"));
         }
       } else {
-        console.log(chalk.yellow("\n⚠️  Could not generate automated fix"));
-        console.log(chalk.gray(`   Reason: ${result.fixSummary.slice(0, 100)}...`));
+        console.log(chalk.yellow("\n⚠️  Analysis complete (no automated fix applied)"));
+        console.log(chalk.gray(`   Summary: ${result.fixSummary.slice(0, 100)}...`));
       }
 
       process.exit(result.success ? 0 : 1);
@@ -207,7 +237,7 @@ program
 // ─────────────────────────────────────────────────────────────
 program
   .command("publish")
-  .description("Create PR from triage result")
+  .description("Publish a failure card or optional PR")
   .requiredOption("--result <file>", "Result JSON file from triage")
   .requiredOption("--base-branch <branch>", "Base branch for PR")
   .option("--config <file>", "Config file path", "greenlit.yml")
@@ -228,41 +258,51 @@ program
 
       const data = JSON.parse(fs.readFileSync(options.result, "utf-8"));
       const result: TriageResult = data.result;
+      const contextData = data.context || {};
       const context: FailureContext = {
-        ...data.context,
+        runId: contextData.runId ?? 0,
+        repo: contextData.repo ?? "unknown/unknown",
+        branch: contextData.branch ?? "unknown",
+        sha: contextData.sha ?? "unknown",
+        workflowName: contextData.workflowName ?? "CI",
+        failureType: contextData.failureType ?? "unknown",
+        failureClass: contextData.failureClass ?? "unknown",
+        routingDecision: contextData.routingDecision ?? result.routingDecision ?? "report_only",
+        failedCommand: contextData.failedCommand ?? "unknown",
+        errorSignature: contextData.errorSignature ?? result.rootCause.split("\n")[0],
+        relevantFiles: contextData.relevantFiles ?? [],
         rawLogs: "",
         extractedErrors: [],
         changedFiles: [],
         recentCommits: [],
-        failedCommand: "",
-        errorSignature: result.rootCause.split("\n")[0],
-        relevantFiles: [],
-        workflowName: "CI",
-        evidence: data.context?.evidence
+        fingerprint: contextData.fingerprint ?? "unknown",
+        evidence: contextData.evidence
       };
 
-      if (!result.success) {
-        console.log(chalk.yellow("⚠️  No successful fix to publish"));
-        if (options.commentOnly) {
-          // Still post a comment with the analysis
-          const config = loadConfig(options.config);
-          const [owner, repo] = context.repo.split("/");
-          const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
-          await postComment(octokit, owner, repo, context, result);
-          console.log(chalk.green("✅ Comment posted"));
-        }
-        process.exit(1);
-      }
-
       const config = loadConfig(options.config);
+      const commentOnly = options.commentOnly || !config.behavior.auto_pr;
       const [owner, repo] = context.repo.split("/");
       const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
 
-      if (options.commentOnly) {
-        // Just post a comment
+      if (!result.failureCard) {
+        result.failureCard = buildFailureCard(
+          context,
+          result,
+          result.ownerAssignment,
+          result.memory
+        );
+      }
+
+      if (commentOnly) {
         await postComment(octokit, owner, repo, context, result);
         console.log(chalk.green("✅ Comment posted"));
-        process.exit(0);
+        process.exit(result.success ? 0 : 1);
+      }
+
+      if (!result.success) {
+        console.log(chalk.yellow("⚠️  No successful fix to publish"));
+        await postComment(octokit, owner, repo, context, result);
+        process.exit(1);
       }
 
       // ─────────────────────────────────────────────────────────────

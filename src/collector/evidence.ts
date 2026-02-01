@@ -1,12 +1,4 @@
-import type { FailedJob } from "./types.js";
-
-export interface EvidencePack {
-  file?: string;
-  line?: string;
-  excerpt?: string;
-  job?: string;
-  step?: string;
-}
+import type { FailedJob, EvidencePack } from "./types.js";
 
 const FILE_LINE_PATTERN =
   /([^\s:]+?\.(?:[jt]sx?|py|go|rs|java|cs|cpp|c|rb|php|kt|swift|scala)):(\d+)(?::\d+)?/g;

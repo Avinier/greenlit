@@ -21,7 +21,7 @@ const GuardrailsSchema = z.object({
 });
 
 const BehaviorSchema = z.object({
-  auto_pr: z.boolean().default(true),
+  auto_pr: z.boolean().default(false),
   require_verification: z.boolean().default(true),
   max_retries: z.number().default(1),
   failure_types: z.array(z.enum(["test", "lint", "typecheck", "build"])).default([
@@ -50,13 +50,21 @@ const SignatureLedgerSchema = z.object({
   ttl_days: z.number().default(30)
 });
 
+const OwnerRoutingSchema = z.object({
+  codeowners_paths: z.array(z.string()).default(["CODEOWNERS", ".github/CODEOWNERS"]),
+  blame_depth: z.number().default(1),
+  team_map: z.record(z.string()).default({}),
+  fallback_owner: z.string().default("unassigned")
+});
+
 const ConfigSchema = z.object({
   version: z.number().default(1),
   guardrails: GuardrailsSchema.default({}),
   behavior: BehaviorSchema.default({}),
   routing: RoutingSchema.default({}),
   output: OutputSchema.default({}),
-  signature_ledger: SignatureLedgerSchema.default({})
+  signature_ledger: SignatureLedgerSchema.default({}),
+  owner_routing: OwnerRoutingSchema.default({})
 });
 
 export type GreenlitConfig = z.infer<typeof ConfigSchema>;
@@ -65,6 +73,7 @@ export type Behavior = z.infer<typeof BehaviorSchema>;
 export type Routing = z.infer<typeof RoutingSchema>;
 export type Output = z.infer<typeof OutputSchema>;
 export type SignatureLedgerConfig = z.infer<typeof SignatureLedgerSchema>;
+export type OwnerRoutingConfig = z.infer<typeof OwnerRoutingSchema>;
 
 /**
  * Load and validate configuration from a YAML file

@@ -24,7 +24,7 @@ guardrails:
 
 # Behavior
 behavior:
-  auto_pr: true                 # Create PR automatically
+  auto_pr: false                # Create PR automatically
   require_verification: true    # Must pass re-run before PR
   max_retries: 1                # Retry fix attempts
   failure_types:                # Which failures to handle
@@ -61,3 +61,11 @@ signature_ledger:
 output:
   pr_title_template: "fix(greenlit): {failure_type} - {summary}"
   branch_prefix: "greenlit/fix"
+
+# Owner routing
+owner_routing:
+  codeowners_paths:
+    - "CODEOWNERS"
+    - ".github/CODEOWNERS"
+  team_map: {}
+  fallback_owner: "unassigned"
