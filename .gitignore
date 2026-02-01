@@ -30,3 +30,6 @@ npm-debug.log*
 greenlit-result.json
 greenlit-result-rca.md
 .greenlit-ledger.json
+
+#eth-insights repo
+eth-insights/
